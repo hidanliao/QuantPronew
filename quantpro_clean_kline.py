@@ -184,7 +184,20 @@ def install_clean_kline(env: dict):
             _apply_font_to_figure(fig)
             self.kline_canvas.figure = fig
             fig.canvas = self.kline_canvas
-            self.kline_canvas.draw()
+            # 关键修复：把新建的固定尺寸 figure 拉伸到 canvas 控件的实际大小，
+            # 否则窗口最大化后图仍是 8x5 英寸、钉在左上角、右下大片空白。
+            try:
+                cw = max(self.kline_canvas.width(), 200)
+                ch = max(self.kline_canvas.height(), 200)
+                dpi = fig.get_dpi() or 100
+                fig.set_size_inches(cw / dpi, ch / dpi)
+                try:
+                    fig.tight_layout(pad=1.2)
+                except Exception:
+                    pass
+            except Exception as _e:
+                logger.warning(f"kline fit canvas: {_e}")
+            self.kline_canvas.draw_idle()
 
             # 刷新概率Tab价格目标卡片（数字信息的干净归处）
             if getattr(self, "_target_data", None) and hasattr(self, "_refresh_price_target_widget"):
@@ -204,8 +217,34 @@ def install_clean_kline(env: dict):
 
     def _build_with_toggle(self):
         from PyQt5.QtWidgets import QCheckBox, QHBoxLayout, QPushButton
+        from PyQt5.QtCore import QObject, QEvent
         _orig_build(self)
         self._show_pred_overlay = False
+        # ── 让K线图始终填满canvas控件（修复最大化后图不放大）──────────
+        # PyQt里实例级覆盖 resizeEvent 无效，必须用事件过滤器捕获 Resize。
+        try:
+            canvas = self.kline_canvas
+
+            class _CanvasFitFilter(QObject):
+                def eventFilter(self, obj, ev):
+                    if ev.type() == QEvent.Resize:
+                        try:
+                            fig = obj.figure
+                            if fig is not None:
+                                dpi = fig.get_dpi() or 100
+                                fig.set_size_inches(max(obj.width(), 200) / dpi,
+                                                    max(obj.height(), 200) / dpi)
+                                try: fig.tight_layout(pad=1.2)
+                                except Exception: pass
+                                obj.draw_idle()
+                        except Exception:
+                            pass
+                    return False  # 不拦截，继续正常处理
+
+            self._kline_fit_filter = _CanvasFitFilter(self)   # 持有引用防GC
+            canvas.installEventFilter(self._kline_fit_filter)
+        except Exception as _e:
+            logger.warning(f"kline canvas resize filter: {_e}")
         # 找到K线tab的内容widget（穿透滚动区）
         inner = None
         if hasattr(self, "tab_inner"):

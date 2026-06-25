@@ -412,20 +412,24 @@ def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
     sym = _normalize(sym); key = f"{sym}_{period}"
     with _cache_lock:
         if key in _data_cache: return _data_cache[key]
+    # ── 关键：用 yf.Ticker(sym).history() 而非 yf.download() ──────────
+    # yf.download() 内部使用全局共享状态，多线程并发调用时会把不同股票的
+    # 数据互相覆盖/错配（症状：多只股票指标完全相同、涨跌%出现天文数字）。
+    # Ticker.history() 每个股票独立对象、不共享全局状态，多线程安全。
     for _ in range(3):
         try:
-            if period == "ytd":
-                start = date(date.today().year, 1, 1).isoformat()
-                df = yf.download(sym, start=start, progress=False, auto_adjust=True)
-            elif period == "max":
-                df = yf.download(sym, period="max", progress=False, auto_adjust=True)
-            else:
-                df = yf.download(sym, period=period, progress=False, auto_adjust=True)
-            if not df.empty:
+            tk = yf.Ticker(sym)
+            df = tk.history(period=period, auto_adjust=True)
+            if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 df = df.loc[:, ~df.columns.duplicated()]
                 for col in ['Open','High','Low','Close','Volume']:
                     if col not in df.columns: raise KeyError(f"Missing {col}")
+                # history() 返回带时区索引 → 转成 tz-naive，保持与其余代码一致
+                try:
+                    if getattr(df.index, "tz", None) is not None:
+                        df.index = df.index.tz_localize(None)
+                except Exception: pass
                 with _cache_lock: _data_cache[key] = df
                 return df
         except Exception as e:
