@@ -306,6 +306,20 @@ _COL_KEYS = ["col_code","col_name","col_price","col_chg","col_rsi","col_cs_rank"
 _PRICE_COL_KEYS = {"col_price","col_sl","col_tp"}
 _NUM_COL_KEYS   = {"col_rsi","col_ma20","col_ma60","col_macd","col_vol_ratio","col_atr","col_cs_rank","col_rel_str"}
 
+# 多周期涨跌：(中文标签, 英文标签, 约交易日数, 行内隐藏字段)
+_CHG_PERIODS = [
+    ("1天","1D",   1,    "_chg_1d"),
+    ("3天","3D",   3,    "_chg_3d"),
+    ("5天","5D",   5,    "_chg_5d"),
+    ("1月","1M",   21,   "_chg_1mo"),
+    ("3月","3M",   63,   "_chg_3mo"),
+    ("1年","1Y",   252,  "_chg_1y"),
+    ("3年","3Y",   756,  "_chg_3y"),
+    ("5年","5Y",   1260, "_chg_5y"),
+]
+def _chg_period_items():
+    return [(zh if LANG=="zh" else en) for zh,en,_,_ in _CHG_PERIODS]
+
 # ══════════════════════════════════════════════════════════════════
 # 工具
 # ══════════════════════════════════════════════════════════════════
@@ -2704,12 +2718,16 @@ _SIG_COLOR = {
 }
 
 class ScanModel(QAbstractTableModel):
-    def __init__(self): super().__init__(); self._rows: List[Dict]=[]
+    def __init__(self): super().__init__(); self._rows: List[Dict]=[]; self.chg_period_label=""
     def rowCount(self,p=QModelIndex()): return len(self._rows)
     def columnCount(self,p=QModelIndex()): return len(_COL_KEYS)
     def headerData(self,sec,ori,role=Qt.DisplayRole):
         if role==Qt.DisplayRole:
-            if ori==Qt.Horizontal: return t(_COL_KEYS[sec])
+            if ori==Qt.Horizontal:
+                ck=_COL_KEYS[sec]
+                if ck=="col_chg" and self.chg_period_label:
+                    return f"{t('col_chg')}({self.chg_period_label})"
+                return t(ck)
             return str(sec+1)
         return None
     def data(self,index,role=Qt.DisplayRole):
@@ -2721,6 +2739,7 @@ class ScanModel(QAbstractTableModel):
                 try: return f"{cur}{float(val):.2f}"
                 except: return str(val)
             if ck=="col_chg":
+                if val is None: return "--"
                 try: return f"{float(val):+.2f}%"
                 except: return str(val)
             if ck=="col_macd":
@@ -2735,6 +2754,7 @@ class ScanModel(QAbstractTableModel):
             if isinstance(val,float): return f"{val:.2f}"
             return str(val) if val is not None else ""
         if role==Qt.UserRole:
+            if ck=="col_chg" and val is None: return -1e12
             try: return float(val)
             except: return str(val) if val is not None else ""
         if role==Qt.TextAlignmentRole:
@@ -2795,6 +2815,16 @@ class ScanModel(QAbstractTableModel):
         if self._rows:
             self.dataChanged.emit(self.index(0,0), self.index(len(self._rows)-1, self.columnCount()-1))
 
+    def set_chg_period(self, period_key: str, label: str):
+        """把 col_chg 列切换成指定周期的涨跌（period_key 是行内隐藏字段名）。"""
+        self.chg_period_label = label
+        for row in self._rows:
+            row['col_chg'] = row.get(period_key)   # 可能为 None（历史不足）
+        chg_col = _COL_KEYS.index("col_chg")
+        if self._rows:
+            self.dataChanged.emit(self.index(0,chg_col), self.index(len(self._rows)-1, chg_col))
+        self.headerDataChanged.emit(Qt.Horizontal, chg_col, chg_col)
+
 class DisplayFilterProxy(QSortFilterProxyModel):
     def __init__(self,parent=None):
         super().__init__(parent); self._text=""; self.setSortRole(Qt.UserRole)
@@ -2835,8 +2865,10 @@ class AnalysisThread(QThread):
 
     def _analyze(self, sym, name):
         try:
-            df=fetch_stock_data(sym,"1y")
-            if df.empty or len(df)<65: return None
+            # 多周期涨跌需要更长历史：拉10年（足够覆盖5年周期），指标只用最近500根算
+            df_full=fetch_stock_data(sym,"10y")
+            if df_full.empty or len(df_full)<65: return None
+            df=df_full.tail(500) if len(df_full)>500 else df_full
             ind=TechnicalIndicators.compute_all(df)
             if ind.empty: return None
             lat=ind.iloc[-1]; hist_close=float(lat['close'])
@@ -2897,7 +2929,18 @@ class AnalysisThread(QThread):
             sl=self.params.get('stop_loss_pct',0.05); tp=self.params.get('take_profit_pct',0.10)
             dyn_sl=max(close-2*atr, close*(1-sl))
 
-            return {
+            # ── 多周期涨跌（用全量历史 close + 当前价）──────────────
+            closes_full=df_full['Close'].squeeze().astype(float).dropna()
+            def _ret_over(nbars):
+                if len(closes_full)>nbars:
+                    past=float(closes_full.iloc[-1-nbars])
+                    if past>0: return round((close-past)/past*100, 2)
+                return None
+            chg_map={}
+            for _zh,_en,_nb,_key in _CHG_PERIODS:
+                chg_map[_key]= round(chg,2) if _key=="_chg_1d" else _ret_over(_nb)
+
+            ret_dict={
                 'col_code':sym,'col_name':name,'col_price':round(close,2),'col_chg':round(chg,2),
                 'col_rsi':round(rsi,1),'col_cs_rank':0,'col_rel_str':round(rel_str,2),
                 'col_ma20':round(ma20,2),'col_ma60':round(ma60,2),'col_macd':round(macd,4),
@@ -2906,6 +2949,8 @@ class AnalysisThread(QThread):
                 'col_tp':round(close*(1+tp),2),'col_detail':detail,
                 '_risk_color':rc,'_score':sc,'_currency':_currency(sym),
             }
+            ret_dict.update(chg_map)
+            return ret_dict
         except: logger.error(f"Analyze {sym}: {traceback.format_exc()}"); return None
 
 # ══════════════════════════════════════════════════════════════════
@@ -4263,6 +4308,10 @@ class QuantApp(QWidget):
     def _build_widgets(self):
         self.input_edit=QLineEdit()
         self.filter_edit=QLineEdit(); self.filter_edit.setFixedWidth(230)
+        # 涨跌周期选择（多周期涨跌排名）
+        self.chg_period_lbl=QLabel()
+        self.chg_period_cb=QComboBox(); self.chg_period_cb.setFixedWidth(96)
+        self.chg_period_cb.addItems(_chg_period_items())
 
         def _btn(txt="",w=None,style_extra=""):
             b=QPushButton(txt)
@@ -4350,7 +4399,9 @@ class QuantApp(QWidget):
     def _build_layout(self):
         root=QVBoxLayout(self); root.setSpacing(8); root.setContentsMargins(14,12,14,12)
         row1=QHBoxLayout()
-        row1.addWidget(self.lbl_code); row1.addWidget(self.input_edit,1); row1.addWidget(self.filter_edit)
+        row1.addWidget(self.lbl_code); row1.addWidget(self.input_edit,1)
+        row1.addWidget(self.chg_period_lbl); row1.addWidget(self.chg_period_cb)
+        row1.addWidget(self.filter_edit)
         root.addLayout(row1)
         row2=QHBoxLayout(); row2.setSpacing(6)
         for b in [self.scan_btn,self.top100_btn,self.bt_btn,self.cross_btn,
@@ -4396,6 +4447,7 @@ class QuantApp(QWidget):
         self.export_btn.clicked.connect(self._export_csv)
         self.cache_btn.clicked.connect(lambda:(clear_cache(),self.status_bar.showMessage(t("status_cache_cleared"),3000)))
         self.filter_edit.textChanged.connect(self.proxy.setFilterText)
+        self.chg_period_cb.currentIndexChanged.connect(self._on_chg_period_changed)
         self.lang_btn.clicked.connect(self._toggle_lang)
 
     def _toggle_lang(self): set_lang("en" if LANG=="zh" else "zh"); self._retranslate()
@@ -4403,6 +4455,18 @@ class QuantApp(QWidget):
     def _retranslate(self):
         self.setWindowTitle(t("win_title")); self.lbl_code.setText(t("lbl_code"))
         self.input_edit.setPlaceholderText(t("lbl_input_ph")); self.filter_edit.setPlaceholderText(t("lbl_filter_ph"))
+        self.chg_period_lbl.setText("涨跌周期:" if LANG=="zh" else "Period:")
+        if hasattr(self,"chg_period_cb"):
+            _i=self.chg_period_cb.currentIndex()
+            self.chg_period_cb.blockSignals(True)
+            self.chg_period_cb.clear(); self.chg_period_cb.addItems(_chg_period_items())
+            self.chg_period_cb.setCurrentIndex(max(_i,0))
+            self.chg_period_cb.blockSignals(False)
+            # 同步表头当前周期标签语言
+            if _i>0:
+                zh,en,_nb,_k=_CHG_PERIODS[_i]
+                self.scan_model.chg_period_label = (zh if LANG=="zh" else en)
+                self.scan_model.headerDataChanged.emit(Qt.Horizontal, _COL_KEYS.index("col_chg"), _COL_KEYS.index("col_chg"))
         self.scan_btn.setText(t("btn_scan")); self.top100_btn.setText(t("btn_top100"))
         self.bt_btn.setText(t("btn_backtest")); self.cross_btn.setText(t("btn_cross"))
         self.portfolio_btn.setText(t("btn_portfolio")); self.coint_btn.setText(t("btn_coint"))
@@ -4485,6 +4549,20 @@ class QuantApp(QWidget):
                 ranks={sym: int(row.get('rank',0)) for sym,row in scores.iterrows()}
                 self.scan_model.update_cs_ranks(ranks)
         except: pass
+
+    def _on_chg_period_changed(self, idx):
+        """切换涨跌周期：更新涨跌%列为该周期、刷新表头、按涨跌降序排名。"""
+        if idx < 0 or idx >= len(_CHG_PERIODS): return
+        zh, en, _nb, key = _CHG_PERIODS[idx]
+        label = zh if LANG=="zh" else en
+        self.scan_model.set_chg_period(key, label)
+        # 按涨跌降序重新排名（涨幅最大的在最上面）
+        chg_col=_COL_KEYS.index("col_chg")
+        self.table.sortByColumn(chg_col, Qt.DescendingOrder)
+        n=self.scan_model.rowCount()
+        if n:
+            self.status_bar.showMessage(
+                (f"涨跌排名已切换为 {label} 周期" if LANG=="zh" else f"Ranking by {label} return"), 3000)
 
     def _start_backtest(self):
         syms=self._parse_input()
