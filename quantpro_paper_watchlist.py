@@ -621,6 +621,13 @@ class AIDetailDialog(QDialog):
         self.setWindowTitle(f"AI趋势分析详情 — {sym}")
         try: self.setWindowIcon(env["_make_app_icon"]())
         except Exception: pass
+        try:
+            _f = self.windowFlags()
+            _f |= Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
+            _f &= ~Qt.WindowContextHelpButtonHint
+            self.setWindowFlags(_f)
+        except Exception:
+            pass
         self.setStyleSheet(env.get("GLOBAL_STYLE", ""))
         self.resize(760, 640)
 
@@ -714,6 +721,15 @@ class PaperWatchlistDialog(QDialog):
         self.setWindowTitle("模拟自选 — 建仓模拟器")
         try: self.setWindowIcon(env["_make_app_icon"]())
         except Exception: pass
+        # 补最小化/最大化按钮，去掉无用的帮助(?)按钮 —— QDialog默认没有最大化按钮，
+        # 跟主程序其它子窗口（配对对比/大盘仪表盘）统一体验，窗口可以放大铺满屏幕。
+        try:
+            _f = self.windowFlags()
+            _f |= Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
+            _f &= ~Qt.WindowContextHelpButtonHint
+            self.setWindowFlags(_f)
+        except Exception:
+            pass
         self.setStyleSheet(env.get("GLOBAL_STYLE", ""))
         self.resize(1180, 720)
 
