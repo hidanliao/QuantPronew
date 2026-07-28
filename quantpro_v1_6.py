@@ -4802,6 +4802,12 @@ if __name__=="__main__":
     except ImportError as _e:
         logger.warning(f"大盘仪表盘未加载（缺文件 quantpro_market_dashboard.py）: {_e}")
 
+    try:
+        from quantpro_paper_watchlist import install_paper_watchlist
+        install_paper_watchlist(globals())
+    except ImportError as _e:
+        logger.warning(f"模拟自选未加载（缺文件 quantpro_paper_watchlist.py）: {_e}")
+        
     # ── ③ 量价分析（K线量价标注 + 量价诊断面板）──────────────────
     try:
         from quantpro_volume_analysis import install_volume_analysis
