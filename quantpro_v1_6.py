@@ -153,25 +153,26 @@ def _apply_font_to_figure(fig: Figure):
             except: pass
 
 def _make_mpf_style() -> dict:
-    mc = mpf.make_marketcolors(up='#10b981', down='#ef4444', edge='inherit', wick='inherit', volume='in')
-    return mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc,
-                               facecolor='#070d14', figcolor='#070d14',
-                               gridcolor='#1e3452', gridstyle='--', rc=_get_mpl_rc())
+    mc = mpf.make_marketcolors(up='#16a34a', down='#dc2626', edge='inherit', wick='inherit', volume='in')
+    return mpf.make_mpf_style(base_mpf_style='starsandstripes', marketcolors=mc,
+                               facecolor='#ffffff', figcolor='#ffffff',
+                               gridcolor='#e2e8df', gridstyle='--', rc=_get_mpl_rc())
 
 # ══════════════════════════════════════════════════════════════════
 # 设计令牌
 # ══════════════════════════════════════════════════════════════════
 class T:
-    BG0='#070d14'; BG1='#0d1826'; BG2='#111f30'; BG3='#172438'; BG4='#1e2f45'
-    ACCENT='#0ea5e9'; ACCENT2='#38bdf8'; GOLD='#f59e0b'; GOLD_LT='#fcd34d'
-    GREEN='#10b981'; GREEN_BG='#052e16'; RED='#ef4444'; RED_BG='#2d0a0a'
-    YELLOW='#f59e0b'; YELLOW_BG='#1c1400'; TEXT_H='#e2eaf3'; TEXT_1='#c8d8e8'
-    TEXT_2='#8ba3be'; TEXT_3='#4e6a82'; BORDER='#1e3452'; BORDER_ACT='#0ea5e9'
-    MPL_BG='#070d14'; MPL_AXES='#0d1826'; PURPLE='#a78bfa'; CYAN='#06b6d4'
-    ORANGE='#f97316'
-    # ── 渐变/高光令牌（v15 视觉升级）──
-    HILITE='#22364f'      # 块顶部高光（比边框更亮，营造玻璃高光）
-    BORDER_HI='#2c4a6e'
+    # ══ Fidelity 抹茶绿 · 浅色极简主题 ══
+    BG0='#f4f7f2'; BG1='#ffffff'; BG2='#ffffff'; BG3='#eef3ea'; BG4='#dceadb'
+    ACCENT='#1b7a43'; ACCENT2='#2f9e5c'; GOLD='#a9822f'; GOLD_LT='#c9ab5e'
+    GREEN='#16a34a'; GREEN_BG='#e8f7ec'; RED='#dc2626'; RED_BG='#fdecec'
+    YELLOW='#d97706'; YELLOW_BG='#fef3e2'; TEXT_H='#16241a'; TEXT_1='#33413a'
+    TEXT_2='#6d7d70'; TEXT_3='#9aab9c'; BORDER='#dde5db'; BORDER_ACT='#1b7a43'
+    MPL_BG='#ffffff'; MPL_AXES='#fbfdf9'; PURPLE='#7c5cb0'; CYAN='#0f9c9c'
+    ORANGE='#d97706'
+    # ── 渐变/高光令牌（浅色卡片顶部高光，营造纸感）──
+    HILITE='#ffffff'
+    BORDER_HI='#eaf1e7'
 
 # ══════════════════════════════════════════════════════════════════
 # 国际化
@@ -327,10 +328,10 @@ def _make_app_icon() -> QIcon:
     sz = 64; px = QPixmap(sz, sz); px.fill(Qt.transparent)
     p = QPainter(px); p.setRenderHint(QPainter.Antialiasing)
     g = QLinearGradient(0, 0, sz, sz)
-    g.setColorAt(0, QColor(7,13,20)); g.setColorAt(1, QColor(14,165,233))
+    g.setColorAt(0, QColor(19,68,41)); g.setColorAt(1, QColor(27,122,67))
     p.setBrush(g); p.setPen(Qt.NoPen); p.drawRoundedRect(0,0,sz,sz,12,12)
     pts = [(6,52),(18,46),(28,38),(38,34),(50,22),(58,18)]
-    pen = QPen(QColor(245,158,11), 2); pen.setCapStyle(Qt.RoundCap); p.setPen(pen)
+    pen = QPen(QColor(245,241,224), 2); pen.setCapStyle(Qt.RoundCap); p.setPen(pen)
     for i in range(len(pts)-1): p.drawLine(*pts[i], *pts[i+1])
     p.end(); return QIcon(px)
 
@@ -1738,17 +1739,17 @@ class StrategyRadarChart:
         angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
         angles += angles[:1]  # 闭合
 
-        ax.set_facecolor('#0d1826')
+        ax.set_facecolor(T.MPL_AXES)
         ax.set_theta_offset(np.pi / 2)
         ax.set_theta_direction(-1)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(StrategyRadarChart.DIMS, color='#8ba3be', fontsize=8)
+        ax.set_xticklabels(StrategyRadarChart.DIMS, color=T.TEXT_2, fontsize=8)
         ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
         ax.set_yticklabels(['', '', '', '', ''], fontsize=6)
         ax.set_ylim(0, 1)
-        ax.grid(color='#1e3452', linestyle='--', linewidth=0.5)
+        ax.grid(color=T.BORDER, linestyle='--', linewidth=0.5)
 
-        palette = colors or ['#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#a78bfa']
+        palette = colors or [T.ACCENT, T.GREEN, T.YELLOW, T.RED, T.PURPLE]
 
         for i, res in enumerate(results):
             vals = [
@@ -1766,7 +1767,7 @@ class StrategyRadarChart:
 
         ax.legend(
             loc='upper right', bbox_to_anchor=(0.1, 0.1),
-            fontsize=7, facecolor='#0d1826', labelcolor='#c8d8e8', edgecolor='#1e3452'
+            fontsize=7, facecolor=T.MPL_AXES, labelcolor=T.TEXT_1, edgecolor=T.BORDER
         )
 
 
@@ -3016,8 +3017,8 @@ class SummaryPanel(QFrame):
            ("watch","sum_watch","--"),("avgRSI","sum_avg_rsi","--"),("avgScore","sum_avg_score","--")]
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"QFrame{{border-radius:10px;border:1px solid {T.BORDER};border-top:1px solid {T.BORDER_HI};"
-                           f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #142539, stop:1 #0d1826);}}")
+        self.setStyleSheet(f"QFrame{{border-radius:10px;border:1px solid {T.BORDER};"
+                           f"background:{T.BG1};}}")
         lay=QHBoxLayout(self); lay.setContentsMargins(16,10,16,10)
         self._titles={}; self._vals={}
         for key,tkey,default in self._DEFS:
@@ -3051,10 +3052,10 @@ class SummaryPanel(QFrame):
 # 翻牌组件
 # ══════════════════════════════════════════════════════════════════
 class FlipBoardWidget(QWidget):
-    # 方向渐变背景（贴近参考截图：涨深绿、跌深红、中性深蓝）
-    _BG_UP   = "qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0c3a26, stop:0.5 #0a2c1d, stop:1 #07140d)"
-    _BG_DOWN = "qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #3a1414, stop:0.5 #2c0d0d, stop:1 #140707)"
-    _BG_NEUT = "qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #142539, stop:1 #0d1826)"
+    # 方向淡色背景（浅色极简：涨淡绿、跌淡红、中性淡灰绿）
+    _BG_UP   = T.GREEN_BG
+    _BG_DOWN = T.RED_BG
+    _BG_NEUT = T.BG3
 
     def __init__(self,parent=None):
         super().__init__(parent); self.setFixedHeight(54)
@@ -3068,9 +3069,9 @@ class FlipBoardWidget(QWidget):
         self.ani.setEasingCurve(QEasingCurve.InOutQuad)
         self.data={}; self.order=['^GSPC','^IXIC','^DJI','^VIX']; self.idx=0
         QTimer(self,timeout=self._next,interval=4000).start()
-    def _set_bg(self, grad):
-        self.setStyleSheet(f"FlipBoardWidget{{background:{grad};border-radius:8px;"
-                           f"border:1px solid {T.BORDER};border-top:1px solid {T.BORDER_HI};}}")
+    def _set_bg(self, color):
+        self.setStyleSheet(f"FlipBoardWidget{{background:{color};border-radius:8px;"
+                           f"border:1px solid {T.BORDER};}}")
     def update_data(self,d): self.data=d; self._show(animate=False)
     def _next(self):
         if not self.data: return
@@ -3166,7 +3167,7 @@ class CrossSectionalDialog(QDialog):
         with mpl.rc_context(_get_mpl_rc()):
             fig = self.heatmap_canvas.figure; fig.clear(); fig.patch.set_facecolor(T.MPL_BG)
             ax = fig.add_subplot(111)
-            cmap = mcolors.LinearSegmentedColormap.from_list('rg', [T.RED,'#0d1826',T.GREEN])
+            cmap = mcolors.LinearSegmentedColormap.from_list('rg', [T.RED,'#ffffff',T.GREEN])
             im = ax.imshow(data.values, aspect='auto', cmap=cmap, vmin=-3, vmax=3)
             ax.set_xticks(range(len(factor_cols)))
             xlabels = [CrossSectionalAlpha.FACTORS.get(c, c)[:6] for c in factor_cols]
@@ -3330,12 +3331,12 @@ class PortfolioDialog(QDialog):
                 vals, labels=syms, autopct='%1.1f%%', colors=colors,
                 textprops={'color':T.TEXT_H,'fontsize':8}, startangle=90
             )
-            for at in autotexts: at.set_color(T.BG0); at.set_fontsize(7)
+            for at in autotexts: at.set_color('#ffffff'); at.set_fontsize(7)
             ax1.set_title("HRP权重分配", color=T.TEXT_H, fontsize=10)
             ax1.set_facecolor(T.MPL_BG)
             # 相关性矩阵
             corr = returns.corr()
-            cmap = mcolors.LinearSegmentedColormap.from_list('rg',[T.RED,'#0d1826',T.GREEN])
+            cmap = mcolors.LinearSegmentedColormap.from_list('rg',[T.RED,'#ffffff',T.GREEN])
             im = ax2.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1, aspect='auto')
             ax2.set_xticks(range(len(corr.columns)))
             ax2.set_yticks(range(len(corr.index)))
@@ -4229,34 +4230,31 @@ class CointegrationDialog(QDialog):
 # ══════════════════════════════════════════════════════════════════
 GLOBAL_STYLE = f"""
 QWidget {{ background:{T.BG0}; color:{T.TEXT_1}; font-family:"Segoe UI","Microsoft YaHei",Arial; font-size:10.5pt; }}
-QWidget#MainWindow {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0a1320, stop:0.55 #081019, stop:1 {T.BG0}); }}
-QGroupBox {{ border:1px solid {T.BORDER}; border-top:1px solid {T.BORDER_HI}; border-radius:10px; margin-top:14px; font-weight:600; color:{T.GOLD};
-             background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #12233a, stop:1 #0b1727); }}
-QGroupBox::title {{ subcontrol-origin:margin; left:12px; padding:0 6px; color:{T.GOLD}; }}
-QLineEdit {{ border:1px solid {T.BORDER}; border-radius:7px; padding:6px 10px; background:{T.BG2}; color:{T.TEXT_H}; selection-background-color:{T.ACCENT}; }}
-QLineEdit:focus {{ border:1px solid {T.ACCENT}; background:#13243a; }}
-QPushButton {{ color:{T.TEXT_H}; border:1px solid {T.BORDER}; border-top:1px solid {T.BORDER_HI}; border-radius:7px; padding:6px 14px; font-weight:600; min-width:52px;
-               background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1a2c44, stop:0.5 #142435, stop:1 #0f1d2e); }}
-QPushButton:hover {{ color:{T.ACCENT2}; border:1px solid {T.ACCENT};
-                     background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1d3b54, stop:1 #122a3f); }}
-QPushButton:pressed {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0f1d2e, stop:1 #1a2c44); }}
+QWidget#MainWindow {{ background:{T.BG0}; }}
+QGroupBox {{ border:1px solid {T.BORDER}; border-radius:10px; margin-top:14px; font-weight:600; color:{T.ACCENT};
+             background:{T.BG1}; }}
+QGroupBox::title {{ subcontrol-origin:margin; left:12px; padding:0 6px; color:{T.ACCENT}; }}
+QLineEdit {{ border:1px solid {T.BORDER}; border-radius:7px; padding:6px 10px; background:{T.BG2}; color:{T.TEXT_H}; selection-background-color:{T.ACCENT}; selection-color:white; }}
+QLineEdit:focus {{ border:1px solid {T.ACCENT}; background:#ffffff; }}
+QPushButton {{ color:{T.TEXT_H}; border:1px solid {T.BORDER}; border-radius:7px; padding:6px 14px; font-weight:600; min-width:52px;
+               background:{T.BG1}; }}
+QPushButton:hover {{ color:{T.ACCENT}; border:1px solid {T.ACCENT}; background:{T.BG3}; }}
+QPushButton:pressed {{ background:{T.BG4}; }}
 QPushButton:disabled {{ background:{T.BG1}; color:{T.TEXT_3}; border-color:{T.BORDER}; }}
-QPushButton:checked {{ color:white; border:1px solid {T.ACCENT2};
-                       background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #38bdf8, stop:1 #0883c0); }}
-QTableView {{ background:{T.BG2}; alternate-background-color:{T.BG3}; gridline-color:{T.BORDER}; selection-background-color:{T.BG4}; selection-color:{T.ACCENT2}; color:{T.TEXT_1}; border:none; }}
-QHeaderView::section {{ color:{T.GOLD}; padding:7px 4px; border:none; border-bottom:1px solid {T.ACCENT}; border-right:1px solid {T.BORDER}; font-size:9.5pt; font-weight:600;
-                        background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #14294a, stop:1 #0b1726); }}
+QPushButton:checked {{ color:white; border:1px solid {T.ACCENT}; background:{T.ACCENT}; }}
+QTableView {{ background:{T.BG2}; alternate-background-color:{T.BG3}; gridline-color:{T.BORDER}; selection-background-color:{T.BG4}; selection-color:{T.ACCENT}; color:{T.TEXT_1}; border:none; }}
+QHeaderView::section {{ color:{T.ACCENT}; padding:7px 4px; border:none; border-bottom:2px solid {T.ACCENT}; border-right:1px solid {T.BORDER}; font-size:9.5pt; font-weight:600;
+                        background:{T.BG1}; }}
 QProgressBar {{ border:none; border-radius:5px; text-align:center; height:12px; background:{T.BG3}; color:{T.TEXT_H}; font-size:8.5pt; }}
-QProgressBar::chunk {{ border-radius:5px;
-                       background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0883c0, stop:0.5 {T.ACCENT}, stop:1 #5cc8f5); }}
+QProgressBar::chunk {{ border-radius:5px; background:{T.ACCENT}; }}
 QTabWidget::pane {{ border:1px solid {T.BORDER}; border-radius:8px; background:{T.BG1}; }}
 QTabBar::tab {{ color:{T.TEXT_2}; padding:7px 16px; margin-right:2px; border-top-left-radius:7px; border-top-right-radius:7px; font-weight:600; font-size:9.5pt; border:1px solid {T.BORDER}; border-bottom:none;
-                background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #13243a, stop:1 #0d1826); }}
-QTabBar::tab:selected {{ color:{T.ACCENT2}; border-color:{T.ACCENT}; border-bottom:2px solid {T.ACCENT2};
-                         background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1a3050, stop:1 #0d1826); }}
-QTabBar::tab:hover:!selected {{ background:{T.BG3}; color:{T.TEXT_H}; }}
-QComboBox {{ border:1px solid {T.BORDER}; border-top:1px solid {T.BORDER_HI}; border-radius:7px; padding:5px 10px; color:{T.TEXT_H};
-             background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1a2c44, stop:1 #0f1d2e); }}
+                background:{T.BG3}; }}
+QTabBar::tab:selected {{ color:{T.ACCENT}; border-color:{T.BORDER}; border-bottom:2px solid {T.ACCENT};
+                         background:{T.BG1}; }}
+QTabBar::tab:hover:!selected {{ background:{T.BG4}; color:{T.TEXT_H}; }}
+QComboBox {{ border:1px solid {T.BORDER}; border-radius:7px; padding:5px 10px; color:{T.TEXT_H};
+             background:{T.BG1}; }}
 QComboBox:hover {{ border:1px solid {T.ACCENT}; }}
 QComboBox::drop-down {{ border:none; }}
 QComboBox::down-arrow {{ image:none; border-left:5px solid transparent; border-right:5px solid transparent; border-top:5px solid {T.TEXT_2}; margin-right:6px; }}
@@ -4265,29 +4263,25 @@ QSpinBox {{ border:1px solid {T.BORDER}; border-radius:7px; padding:4px 6px; bac
 QSpinBox:focus {{ border:1px solid {T.ACCENT}; }}
 QTextEdit, QTextBrowser {{ background:{T.BG2}; border:1px solid {T.BORDER}; color:{T.TEXT_1}; font-size:9.5pt; border-radius:8px; padding:4px; }}
 QSlider::groove:horizontal {{ height:5px; background:{T.BG3}; border-radius:3px; }}
-QSlider::handle:horizontal {{ width:15px; height:15px; border-radius:8px; margin:-6px 0; border:1px solid {T.ACCENT2};
-                              background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #7fd4f7, stop:0.5 {T.ACCENT}, stop:1 #0883c0); }}
-QSlider::handle:horizontal:hover {{ border:1px solid white; }}
-QSlider::sub-page:horizontal {{ border-radius:3px;
-                                background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0883c0, stop:1 {T.ACCENT2}); }}
+QSlider::handle:horizontal {{ width:15px; height:15px; border-radius:8px; margin:-6px 0; border:1px solid {T.ACCENT};
+                              background:{T.ACCENT2}; }}
+QSlider::handle:horizontal:hover {{ border:1px solid {T.ACCENT}; background:{T.ACCENT}; }}
+QSlider::sub-page:horizontal {{ border-radius:3px; background:{T.ACCENT}; }}
 QSplitter::handle {{ background:{T.BORDER}; }}
 QStatusBar {{ color:{T.TEXT_2}; font-size:9pt; border-top:1px solid {T.BORDER};
-              background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0d1826, stop:1 #0a121e); }}
+              background:{T.BG1}; }}
 QCheckBox {{ color:{T.TEXT_1}; }}
 QCheckBox::indicator {{ width:16px; height:16px; border-radius:5px; border:1px solid {T.BORDER}; background:{T.BG2}; }}
-QCheckBox::indicator:checked {{ border:1px solid {T.ACCENT2};
-                                background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #38bdf8, stop:1 #0883c0); }}
+QCheckBox::indicator:checked {{ border:1px solid {T.ACCENT}; background:{T.ACCENT}; }}
 QScrollBar:vertical {{ background:{T.BG1}; width:9px; border:none; margin:0; }}
-QScrollBar::handle:vertical {{ border-radius:4px; min-height:24px;
-                               background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {T.BG4}, stop:1 #25405f); }}
+QScrollBar::handle:vertical {{ border-radius:4px; min-height:24px; background:{T.BG4}; }}
 QScrollBar::handle:vertical:hover {{ background:{T.ACCENT}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
 QScrollBar:horizontal {{ background:{T.BG1}; height:9px; border:none; margin:0; }}
-QScrollBar::handle:horizontal {{ border-radius:4px; min-width:24px;
-                                 background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {T.BG4}, stop:1 #25405f); }}
+QScrollBar::handle:horizontal {{ border-radius:4px; min-width:24px; background:{T.BG4}; }}
 QScrollBar::handle:horizontal:hover {{ background:{T.ACCENT}; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0; }}
-QDialog {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0a1320, stop:1 {T.BG0}); }}
+QDialog {{ background:{T.BG0}; }}
 """
 
 # ══════════════════════════════════════════════════════════════════
@@ -4777,10 +4771,28 @@ except Exception as _e:
 # ══════════════════════════════════════════════════════════════════
 # 入口
 # ══════════════════════════════════════════════════════════════════
-if __name__=="__main__":
+if __name__ == "__main__":
+    # ── 高DPI适配（必须在 QApplication 创建之前设置）──────────────
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
+    for attr in ('AA_EnableHighDpiScaling','AA_UseHighDpiPixmaps'):
+        if hasattr(Qt, attr):
+            QApplication.setAttribute(getattr(Qt, attr))
+    
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setWindowIcon(_make_app_icon())
+    
+    db = QFontDatabase()
+    for f in ["Microsoft YaHei","SimHei","PingFang SC","Noto Sans CJK SC"]:
+        if f in db.families():
+            app.setFont(QFont(f, 10))
+            break
+
     # ── ① v14 方法论注入（必须在创建任何引擎/窗口之前）─────────────
-    #    Purged CV + 方向标签 + 基准率居中 + 轻校准 + DSR
-    #    fetch_fn 启用 v14.2 大盘上下文（SPY/VIX，残差IC自动筛选）
     try:
         from quantpro_v14_alpha_engine import patch_quantpro
         patch_quantpro(ProbabilityEngine, WalkForwardBacktest, SelfCorrectionEngine,
@@ -4788,44 +4800,49 @@ if __name__=="__main__":
     except ImportError as _e:
         logger.warning(f"v14 alpha engine 未加载（缺文件 quantpro_v14_alpha_engine.py）: {_e}")
 
-    # ── ② 配对对比功能（主窗口按钮 + 协整窗口双击）────────────────
+    # ── ② 安装 ticker_logos 工具集（必须先于 scan_logos 和 market_dashboard） ──
     try:
-        from quantpro_pair_compare import install_pair_compare
-        install_pair_compare(globals())
+        from quantpro_ticker_logos import install_ticker_logos
+        install_ticker_logos(globals())
     except ImportError as _e:
-        logger.warning(f"配对对比未加载（缺文件 quantpro_pair_compare.py）: {_e}")
+        logger.warning(f"ticker_logos 未加载（缺文件 quantpro_ticker_logos.py）: {_e}")
 
-    # ── ③ 大盘状态仪表盘（主窗口按钮）────────────────────────────
+    # ── ③ 安装扫描列表 logo 功能（必须在 QuantApp 创建之前） ──────
+    try:
+        from quantpro_scan_logos import install_scan_logos
+        install_scan_logos(globals())
+    except ImportError as _e:
+        logger.warning(f"scan_logos 未加载（缺文件 quantpro_scan_logos.py）: {_e}")
+
+    # ── ④ 安装大盘仪表盘（依赖 ticker_logos） ──────────────────────
     try:
         from quantpro_market_dashboard import install_market_dashboard
         install_market_dashboard(globals())
     except ImportError as _e:
         logger.warning(f"大盘仪表盘未加载（缺文件 quantpro_market_dashboard.py）: {_e}")
 
+    # ── ⑤ 配对对比功能（主窗口按钮 + 协整窗口双击）────────────────
+    try:
+        from quantpro_pair_compare import install_pair_compare
+        install_pair_compare(globals())
+    except ImportError as _e:
+        logger.warning(f"配对对比未加载（缺文件 quantpro_pair_compare.py）: {_e}")
+
+    # ── ⑥ 模拟自选 ──────────────────────────────────────────────
     try:
         from quantpro_paper_watchlist import install_paper_watchlist
         install_paper_watchlist(globals())
     except ImportError as _e:
         logger.warning(f"模拟自选未加载（缺文件 quantpro_paper_watchlist.py）: {_e}")
-        
-    # ── ③ 量价分析（K线量价标注 + 量价诊断面板）──────────────────
+
+    # ── ⑦ 量价分析（K线量价标注 + 量价诊断面板）──────────────────
     try:
         from quantpro_volume_analysis import install_volume_analysis
         install_volume_analysis(globals())
     except ImportError as _e:
         logger.warning(f"量价分析未加载（缺文件 quantpro_volume_analysis.py）: {_e}")
 
-    # ── 高DPI适配（必须在 QApplication 创建之前设置）──────────────
-    #    解决 Windows 125%/150% 缩放下窗口尺寸算不准、超出屏幕的问题
-    try:
-        QApplication.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    except Exception:
-        pass
-    for attr in ('AA_EnableHighDpiScaling','AA_UseHighDpiPixmaps'):
-        if hasattr(Qt,attr): QApplication.setAttribute(getattr(Qt,attr))
-    app=QApplication(sys.argv); app.setStyle("Fusion"); app.setWindowIcon(_make_app_icon())
-    db=QFontDatabase()
-    for f in ["Microsoft YaHei","SimHei","PingFang SC","Noto Sans CJK SC"]:
-        if f in db.families(): app.setFont(QFont(f,10)); break
-    win=QuantApp(); win.show(); sys.exit(app.exec_())
+    # ── ⑧ 创建主窗口 ────────────────────────────────────────────
+    win = QuantApp()
+    win.show()
+    sys.exit(app.exec_())

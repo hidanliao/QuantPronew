@@ -205,27 +205,27 @@ class KlineOverlayPainter:
     在 mplfinance 绘制的 K 线图基础上叠加价格目标层
     """
 
-    # 设计令牌（与 QuantPro T 一致）
-    GREEN   = '#10b981'
-    RED     = '#ef4444'
-    GOLD    = '#f59e0b'
-    ACCENT  = '#0ea5e9'
-    PURPLE  = '#a78bfa'
-    ORANGE  = '#f97316'
-    CYAN    = '#06b6d4'
-    TEXT_2  = '#8ba3be'
-    TEXT_3  = '#4e6a82'
-    BG2     = '#0d1826'
-    BORDER  = '#1e3452'
+    # 设计令牌（与 QuantPro T 一致 — 抹茶绿浅色主题）
+    GREEN   = '#16a34a'
+    RED     = '#dc2626'
+    GOLD    = '#a9822f'
+    ACCENT  = '#1b7a43'
+    PURPLE  = '#7c5cb0'
+    ORANGE  = '#d97706'
+    CYAN    = '#0f9c9c'
+    TEXT_2  = '#6d7d70'
+    TEXT_3  = '#9aab9c'
+    BG2     = '#ffffff'
+    BORDER  = '#dde5db'
 
     FIB_COLORS = {
-        'fib_0000':  '#ef4444',   # 0%   — 高点，红
-        'fib_0236':  '#f97316',   # 23.6%
-        'fib_0382':  '#f59e0b',   # 38.2%
-        'fib_0500':  '#10b981',   # 50%  — 绿
-        'fib_0618':  '#0ea5e9',   # 61.8%— 黄金比例，蓝
-        'fib_0786':  '#a78bfa',   # 78.6%
-        'fib_1000':  '#38bdf8',   # 100% — 低点，浅蓝
+        'fib_0000':  '#dc2626',   # 0%   — 高点，红
+        'fib_0236':  '#ea580c',   # 23.6%
+        'fib_0382':  '#d97706',   # 38.2%
+        'fib_0500':  '#16a34a',   # 50%  — 绿
+        'fib_0618':  '#1b7a43',   # 61.8%— 黄金比例，主品牌抹茶绿
+        'fib_0786':  '#7c5cb0',   # 78.6%
+        'fib_1000':  '#0f9c9c',   # 100% — 低点，青
     }
     FIB_LABELS = {
         'fib_0000': '0%',
@@ -398,13 +398,13 @@ except ImportError:
 
 if HAS_QT:
 
-    # ── 设计令牌（与 QuantPro T 同步）──
+    # ── 设计令牌（与 QuantPro T 同步 — 抹茶绿浅色主题）──
     class _T:
-        BG0='#070d14'; BG1='#0d1826'; BG2='#111f30'; BG3='#172438'; BG4='#1e2f45'
-        ACCENT='#0ea5e9'; ACCENT2='#38bdf8'; GOLD='#f59e0b'
-        GREEN='#10b981'; RED='#ef4444'; YELLOW='#f59e0b'
-        TEXT_H='#e2eaf3'; TEXT_1='#c8d8e8'; TEXT_2='#8ba3be'; TEXT_3='#4e6a82'
-        BORDER='#1e3452'; PURPLE='#a78bfa'; CYAN='#06b6d4'; ORANGE='#f97316'
+        BG0='#f4f7f2'; BG1='#ffffff'; BG2='#ffffff'; BG3='#eef3ea'; BG4='#dceadb'
+        ACCENT='#1b7a43'; ACCENT2='#2f9e5c'; GOLD='#a9822f'
+        GREEN='#16a34a'; RED='#dc2626'; YELLOW='#d97706'
+        TEXT_H='#16241a'; TEXT_1='#33413a'; TEXT_2='#6d7d70'; TEXT_3='#9aab9c'
+        BORDER='#dde5db'; PURPLE='#7c5cb0'; CYAN='#0f9c9c'; ORANGE='#d97706'
 
     class PriceTargetCard(QFrame):
         """
@@ -550,12 +550,12 @@ if HAS_QT:
             fib_box.addWidget(fib_hdr)
 
             fib_defs = [
-                ('fib_0000', '0.0%',   '#ef4444'),
-                ('fib_0236', '23.6%',  '#f97316'),
-                ('fib_0382', '38.2%',  '#f59e0b'),
-                ('fib_0500', '50.0%',  '#10b981'),
-                ('fib_0618', '61.8%*', '#0ea5e9'),
-                ('fib_1000', '100%',   '#38bdf8'),
+                ('fib_0000', '0.0%',   '#dc2626'),
+                ('fib_0236', '23.6%',  '#ea580c'),
+                ('fib_0382', '38.2%',  '#d97706'),
+                ('fib_0500', '50.0%',  '#16a34a'),
+                ('fib_0618', '61.8%*', '#1b7a43'),
+                ('fib_1000', '100%',   '#0f9c9c'),
             ]
             for key, label, col in fib_defs:
                 val = fib.get(key)

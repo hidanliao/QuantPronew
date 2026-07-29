@@ -480,11 +480,11 @@ if __name__ == "__main__":
 
     # 最小 env + 对话框冒烟（offscreen 渲染三联图）
     class _T:
-        MPL_BG = "#0d1826"; BG2 = "#111f30"; BORDER = "#1e3452"
-        GOLD = "#f59e0b"; ACCENT = "#0ea5e9"; CYAN = "#06b6d4"
-        PURPLE = "#a78bfa"; GREEN = "#10b981"; RED = "#ef4444"
-        ORANGE = "#f97316"; TEXT_H = "#e2eaf3"; TEXT_2 = "#8ba3be"
-        TEXT_3 = "#4e6a82"
+        MPL_BG = "#ffffff"; BG2 = "#ffffff"; BORDER = "#dde5db"
+        GOLD = "#a9822f"; ACCENT = "#1b7a43"; CYAN = "#0f9c9c"
+        PURPLE = "#7c5cb0"; GREEN = "#16a34a"; RED = "#dc2626"
+        ORANGE = "#d97706"; TEXT_H = "#16241a"; TEXT_2 = "#6d7d70"
+        TEXT_3 = "#9aab9c"
 
     def _fetch(sym, period="1y"):
         return pd.DataFrame({"Close": spx if "GSPC" in sym else vix})

@@ -41,10 +41,16 @@ from PyQt5.QtWidgets import (
     QApplication, QGridLayout, QFrame, QScrollArea, QWidget
 )
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib as mpl
 import matplotlib.gridspec as gridspec
+
+try:
+    import quantpro_ticker_logos as _tlogos   # 可选：装了logo模块才显示板块ETF logo条
+except ImportError:
+    _tlogos = None
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +289,24 @@ class MarketRegimeDashboard(QDialog):
         self.status.setStyleSheet(f"color:{T.TEXT_2};font-size:9pt;border:none;")
         lay.addWidget(self.status)
 
+        # 板块ETF速览条（logo + 代码 + 当日涨跌%，TradingView那种ticker strip风格）
+        strip_scroll = QScrollArea()
+        strip_scroll.setWidgetResizable(True)
+        strip_scroll.setFixedHeight(58)
+        strip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        strip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        strip_scroll.setStyleSheet(f"border:1px solid {T.BORDER};border-radius:6px;")
+        self.sector_strip_host = QWidget()
+        self.sector_strip_lay = QHBoxLayout(self.sector_strip_host)
+        self.sector_strip_lay.setContentsMargins(8, 6, 8, 6)
+        self.sector_strip_lay.setSpacing(10)
+        strip_scroll.setWidget(self.sector_strip_host)
+        lay.addWidget(strip_scroll)
+        if _tlogos:
+            strip_attr = QLabel(_tlogos.attribution_html())
+            strip_attr.setOpenExternalLinks(True)
+            lay.addWidget(strip_attr)
+
         # 图表
         self.canvas = FigureCanvas(Figure(figsize=(9.5, 3.6), facecolor=T.MPL_BG))
         lay.addWidget(self.canvas, 1)
@@ -318,6 +342,97 @@ class MarketRegimeDashboard(QDialog):
             self.status.setText(d.get("msg", "计算失败")); return
         self._data = d
         self._render()
+        self._refresh_sector_strip()
+
+    def _refresh_sector_strip(self):
+        """板块ETF当日涨跌% —— 独立小抓取，供logo速览条用，不影响主指标计算逻辑。"""
+        fetch = self.env["fetch_stock_data"]
+        chg = {}
+        for sym in SECTOR_ETFS:
+            try:
+                df = fetch(sym, "5d")
+                if df is not None and len(df) >= 2:
+                    c = df["Close"].astype(float)
+                    chg[sym] = float((c.iloc[-1] - c.iloc[-2]) / c.iloc[-2] * 100.0)
+            except Exception as e:
+                logger.warning(f"sector strip fetch fail {sym}: {e}")
+        self._render_sector_strip(chg)
+
+    def _render_sector_strip(self, chg: dict):
+        T = self.T
+        while self.sector_strip_lay.count():
+            it = self.sector_strip_lay.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        self._strip_chip_by_symbol = {}
+        for sym in SECTOR_ETFS:
+            pct = chg.get(sym)
+            color = T.GREEN if (pct is not None and pct >= 0) else (T.RED if pct is not None else T.TEXT_3)
+            chip = QFrame()
+            chip.setStyleSheet(f"QFrame{{background:{T.BG2};border:1px solid {T.BORDER};border-radius:7px;}}")
+            cl = QHBoxLayout(chip); cl.setContentsMargins(6, 3, 8, 3); cl.setSpacing(5)
+            icon_lbl = QLabel()
+            icon_lbl.setFixedSize(20, 20)
+            if _tlogos:
+                icon_lbl.setPixmap(_tlogos.get_or_fallback_icon(sym, 20).pixmap(20, 20))
+            cl.addWidget(icon_lbl)
+            txt = f"<b style='color:{T.TEXT_H};'>{sym}</b><br>"
+            txt += (f"<span style='color:{color};font-size:8pt;'>{pct:+.2f}%</span>" if pct is not None
+                    else f"<span style='color:{T.TEXT_3};font-size:8pt;'>--</span>")
+            lb = QLabel(txt); lb.setStyleSheet("border:none;")
+            cl.addWidget(lb)
+            self.sector_strip_lay.addWidget(chip)
+            self._strip_chip_by_symbol[sym] = icon_lbl
+        self.sector_strip_lay.addStretch()
+        self._start_strip_logo_loading()
+
+    def _start_strip_logo_loading(self):
+        """启动后台线程加载板块ETF的logo，并在线程结束时清理引用。"""
+        if not _tlogos:
+            return
+        old = getattr(self, "_strip_logo_thread", None)
+        if old is not None and old.isRunning():
+            old.quit()
+            old.wait(200)
+        symbols = list(self._strip_chip_by_symbol.keys())
+        if not symbols:
+            return
+        th = _tlogos.LogoLoaderThread(symbols, parent=self)
+        th.loaded.connect(self._on_strip_logo_loaded)
+        th.missing.connect(self._on_strip_logo_missing)
+        # 关键修复：线程结束后清空引用，防止 closeEvent 访问已删除对象
+        th.finished_all.connect(lambda: setattr(self, '_strip_logo_thread', None))
+        self._strip_logo_thread = th
+        th.start()
+
+    def _on_strip_logo_loaded(self, symbol, data):
+        pm = _tlogos.pixmap_from_bytes(data, 20)
+        if pm is None:
+            return
+        _tlogos.cache_pixmap(symbol, 20, pm)
+        lbl = self._strip_chip_by_symbol.get(symbol)
+        if lbl is not None:
+            lbl.setPixmap(QIcon(pm).pixmap(20, 20))
+
+    def _on_strip_logo_missing(self, symbol):
+        pm = _tlogos.make_fallback_icon(symbol, 20)
+        _tlogos.cache_pixmap(symbol, 20, pm)
+        lbl = self._strip_chip_by_symbol.get(symbol)
+        if lbl is not None:
+            lbl.setPixmap(QIcon(pm).pixmap(20, 20))
+
+    def closeEvent(self, event):
+        """安全关闭线程，防止访问已删除的 LogoLoaderThread 对象。"""
+        th = getattr(self, "_strip_logo_thread", None)
+        if th is not None:
+            try:
+                if th.isRunning():
+                    th.quit()
+                    th.wait(1000)
+            except RuntimeError:
+                # 对象已被删除，忽略
+                pass
+            self._strip_logo_thread = None
+        super().closeEvent(event)
 
     def _render(self):
         T = self.T; d = self._data
@@ -492,10 +607,10 @@ if __name__ == "__main__":
 
     # 窗口冒烟
     class _T:
-        MPL_BG="#070d14"; MPL_AXES="#0d1826"; BG2="#111f30"; BORDER="#1e3452"
-        GOLD="#f59e0b"; YELLOW="#f59e0b"; ACCENT="#0ea5e9"; CYAN="#06b6d4"
-        PURPLE="#a78bfa"; GREEN="#10b981"; RED="#ef4444"; ORANGE="#f97316"
-        TEXT_H="#e2eaf3"; TEXT_1="#c8d8e8"; TEXT_2="#8ba3be"; TEXT_3="#4e6a82"
+        MPL_BG="#ffffff"; MPL_AXES="#fbfdf9"; BG2="#ffffff"; BORDER="#dde5db"
+        GOLD="#a9822f"; YELLOW="#d97706"; ACCENT="#1b7a43"; CYAN="#0f9c9c"
+        PURPLE="#7c5cb0"; GREEN="#16a34a"; RED="#dc2626"; ORANGE="#d97706"
+        TEXT_H="#16241a"; TEXT_1="#33413a"; TEXT_2="#6d7d70"; TEXT_3="#9aab9c"
     def _style(ax, title="", xlabel="", ylabel=""):
         ax.set_facecolor(_T.MPL_AXES); ax.set_title(title, color=_T.TEXT_H, fontsize=9)
     env = {"QuantApp": None, "fetch_stock_data": _fetch, "T": _T, "GLOBAL_STYLE": "",
@@ -507,3 +622,4 @@ if __name__ == "__main__":
     print(f"\n窗口冒烟: 子图数={len(dlg.canvas.figure.axes)}(应=2) "
           f"明细行数={dlg.grid.rowCount()} 环境分标签非空={bool(dlg.score_lbl.text())}")
     print("全部自检通过 ✓")
+    dlg.close()  # 触发 closeEvent，等后台logo线程收尾，避免退出时 QThread 未结束报错

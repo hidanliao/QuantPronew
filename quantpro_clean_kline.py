@@ -142,11 +142,11 @@ def install_clean_kline(env: dict):
             if gc_idx.any():
                 addplots.append(mpf.make_addplot(
                     gc_series, type='scatter', marker='^', markersize=90,
-                    color='#10b981', panel=0))
+                    color=T.GREEN, panel=0))
             if dc_idx.any():
                 addplots.append(mpf.make_addplot(
                     dc_series, type='scatter', marker='v', markersize=90,
-                    color='#ef4444', panel=0))
+                    color=T.RED, panel=0))
 
             # 可选叠加层（默认关，避免糊乱）—— 用户可用「预测带」开关打开
             show_overlay = getattr(self, "_show_pred_overlay", False)

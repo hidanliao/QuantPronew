@@ -35,7 +35,7 @@ import logging
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
@@ -49,10 +49,17 @@ from PyQt5.QtWidgets import (
     QTabWidget, QWidget, QAbstractItemView, QSplitter, QSpinBox, QApplication,
     QProgressBar, QTextEdit, QButtonGroup,
 )
-from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal, QSize, QTimer
+from PyQt5.QtGui import QColor, QPixmap, QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+try:
+    import quantpro_ticker_logos as _tlogos
+    HAS_LOGOS = True
+except ImportError:
+    _tlogos = None
+    HAS_LOGOS = False
 
 try:
     import mplfinance as mpf
@@ -113,9 +120,17 @@ class PaperWatchlistStore:
                         id           INTEGER PRIMARY KEY AUTOINCREMENT,
                         name         TEXT NOT NULL,
                         created_date TEXT NOT NULL,
-                        note         TEXT
+                        note         TEXT,
+                        compare_date TEXT
                     )
                 """)
+                # 老版本DB（建表时还没有compare_date列）在这里补列；新建的表已经带了这一列，
+                # ALTER会报"duplicate column"，直接吞掉即可，不影响其它列。
+                try:
+                    c.execute("ALTER TABLE paper_plans ADD COLUMN compare_date TEXT")
+                    conn.commit()
+                except Exception:
+                    pass
                 c.execute("""
                     CREATE TABLE IF NOT EXISTS paper_positions (
                         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,6 +273,25 @@ class PaperWatchlistStore:
                 conn.close()
 
     @classmethod
+    def record_snapshot_for_date(cls, plan_id: int, snap_date: str, total_cost: float, total_value: float):
+        """按指定历史日期写入/覆盖一条快照 —— 供「补录快照」回填缺口用。
+        普通刷新走 record_snapshot（固定记today）；这个方法允许指定过去某天。"""
+        pnl_pct = ((total_value - total_cost) / total_cost * 100.0) if total_cost else 0.0
+        with cls._LOCK:
+            conn = cls._conn(); c = conn.cursor()
+            try:
+                c.execute("""INSERT INTO paper_snapshots(plan_id,snap_date,total_cost,total_value,pnl_pct)
+                             VALUES(?,?,?,?,?)
+                             ON CONFLICT(plan_id,snap_date)
+                             DO UPDATE SET total_cost=excluded.total_cost,
+                                           total_value=excluded.total_value,
+                                           pnl_pct=excluded.pnl_pct""",
+                          (plan_id, snap_date, total_cost, total_value, pnl_pct))
+                conn.commit()
+            finally:
+                conn.close()
+
+    @classmethod
     def list_snapshots(cls, plan_id: int) -> List[Dict]:
         with cls._LOCK:
             conn = cls._conn(); c = conn.cursor()
@@ -292,6 +326,292 @@ class PaperWatchlistStore:
                 conn.commit()
             finally:
                 conn.close()
+
+    # ── 对比基准日（"改日期看涨跌"功能，每套方案各自记一个）──────
+    @classmethod
+    def get_compare_date(cls, plan_id: int) -> Optional[str]:
+        with cls._LOCK:
+            conn = cls._conn(); c = conn.cursor()
+            try:
+                c.execute("SELECT compare_date FROM paper_plans WHERE id=?", (plan_id,))
+                row = c.fetchone()
+                return row[0] if row and row[0] else None
+            finally:
+                conn.close()
+
+    @classmethod
+    def set_compare_date(cls, plan_id: int, date_str: Optional[str]):
+        with cls._LOCK:
+            conn = cls._conn(); c = conn.cursor()
+            try:
+                c.execute("UPDATE paper_plans SET compare_date=? WHERE id=?", (date_str, plan_id))
+                conn.commit()
+            finally:
+                conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 快照补录：把「没打开软件/没点刷新」造成的 paper_snapshots 缺口，
+# 用 yfinance 历史收盘价倒算补齐。
+#
+# 前提（必须明确告知用户，补不是万能的）：
+#   只能补"缺口期间持仓构成没变过"的部分 —— 因为 paper_positions 表只存
+#   当前持仓，没有历史持仓构成的记录。所以补录起点 = max(已有最后一条快照
+#   日期, 当前所有持仓里最晚一笔的buy_date) 的次日，这样能保证在补录区间
+#   内，"现在看到的这套持仓"从头到尾都已经建好仓、构成没变，倒算才站得住。
+#   如果缺口期间你加过仓/减过仓/换过标的，那部分没法精确复原，只能按现在
+#   的持仓结构近似。
+# ══════════════════════════════════════════════════════════════════
+def backfill_paper_snapshots(env: dict, plan_id: int) -> Dict:
+    """
+    检测该方案快照日期缺口，用 yfinance 历史收盘价回填 paper_snapshots。
+    返回 {"ok": bool, "filled": int, "start": str|None, "end": str|None, "msg": str}
+    """
+    positions = PaperWatchlistStore.list_positions(plan_id)
+    if not positions:
+        return {"ok": False, "filled": 0, "start": None, "end": None, "msg": "这套方案还没有持仓，无法补录"}
+
+    fetch = env["fetch_stock_data"]
+    today = date.today()
+
+    snaps = PaperWatchlistStore.list_snapshots(plan_id)
+    last_snap = max((s["snap_date"] for s in snaps), default=None)
+    last_buy = max(p["buy_date"] for p in positions)
+    start_candidates = [d for d in (last_snap, last_buy) if d]
+    start_str = max(start_candidates)
+    try:
+        start_d = datetime.strptime(start_str, "%Y-%m-%d").date() + timedelta(days=1)
+    except Exception:
+        return {"ok": False, "filled": 0, "start": None, "end": None, "msg": f"日期解析失败: {start_str}"}
+
+    end_d = today - timedelta(days=1)  # 今天留给正常的「刷新价格」去记，避免跟实时价打架
+    if start_d > end_d:
+        return {"ok": True, "filled": 0, "start": None, "end": None, "msg": "没有需要补录的缺口"}
+
+    span_days = (today - start_d).days
+    period = "6mo" if span_days <= 150 else ("1y" if span_days <= 300 else ("2y" if span_days <= 600 else "5y"))
+
+    total_cost = sum(p["qty"] * p["buy_price"] for p in positions)
+
+    # 逐标的拉历史收盘；不同市场节假日不完全对齐，后面按并集日期+前向填充处理
+    closes: Dict[str, pd.Series] = {}
+    failed_syms = []
+    for p in positions:
+        try:
+            df = fetch(p["symbol"], period)
+            if df is not None and not df.empty:
+                closes[p["symbol"]] = df["Close"].copy()
+            else:
+                failed_syms.append(p["symbol"])
+        except Exception as e:
+            failed_syms.append(p["symbol"])
+            logger.warning(f"补录快照取价失败 {p['symbol']}: {e}")
+
+    if not closes:
+        return {"ok": False, "filled": 0, "start": None, "end": None, "msg": "标的历史价格全部获取失败，无法补录"}
+
+    all_dates = sorted(set().union(*[s.index for s in closes.values()]))
+    all_dates = [d for d in all_dates if start_d <= d.date() <= end_d]
+    if not all_dates:
+        return {"ok": True, "filled": 0, "start": None, "end": None, "msg": "该缺口区间内没有交易日"}
+
+    filled = 0
+    for dt in all_dates:
+        total_value = 0.0
+        got_any_price = False
+        for p in positions:
+            ser = closes.get(p["symbol"])
+            if ser is None:
+                total_value += p["qty"] * p["buy_price"]  # 取不到价的标的按成本价近似，避免整条快照报废
+                continue
+            px = ser[ser.index <= dt]
+            if px.empty:
+                total_value += p["qty"] * p["buy_price"]
+                continue
+            total_value += p["qty"] * float(px.iloc[-1])
+            got_any_price = True
+        if not got_any_price:
+            continue
+        PaperWatchlistStore.record_snapshot_for_date(
+            plan_id, dt.date().isoformat(), total_cost, total_value)
+        filled += 1
+
+    msg = f"补录完成，共补{filled}条（{all_dates[0].date().isoformat()} ~ {all_dates[-1].date().isoformat()}）"
+    if failed_syms:
+        msg += f"\n以下标的取价失败，期间按成本价近似：{', '.join(failed_syms)}"
+    return {"ok": True, "filled": filled,
+            "start": all_dates[0].date().isoformat() if all_dates else None,
+            "end": all_dates[-1].date().isoformat() if all_dates else None,
+            "msg": msg}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 「对比基准日」功能：改一个历史日期，按现在的持仓数量折算那天的市值，
+# 跟现价市值比涨跌%——跟持仓的真实买入价/买入日期无关，是独立的"如果
+# 拿现在这些股数倒回那天看，涨了还是跌了"的对比工具，每套方案独立存。
+# ══════════════════════════════════════════════════════════════════
+def _price_asof(fetch_stock_data, symbol: str, target: date) -> Optional[Tuple[float, date]]:
+    """返回 (收盘价, 实际使用的交易日) —— target 当天不是交易日（周末/节假日）
+    就取之前最近一个交易日；target 在该标的最早数据之前，或取数失败，返回 None。
+    period按跨度分桶、留足缓冲，避免"5天前"这种边界因为周末/节假日缺一天。"""
+    today = date.today()
+    if target > today:
+        target = today  # 不允许对比未来，兜底按今天处理
+    span_days = (today - target).days
+    if span_days <= 20:
+        period = "1mo"
+    elif span_days <= 80:
+        period = "3mo"
+    elif span_days <= 160:
+        period = "6mo"
+    elif span_days <= 300:
+        period = "1y"
+    elif span_days <= 620:
+        period = "2y"
+    elif span_days <= 1500:
+        period = "5y"
+    elif span_days <= 3000:
+        period = "10y"
+    else:
+        period = "max"
+    try:
+        df = fetch_stock_data(symbol, period)
+    except Exception:
+        return None
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    try:
+        close = df["Close"]
+        target_ts = pd.Timestamp(target)
+        sel = close[close.index.normalize() <= target_ts]
+        if sel.empty:
+            return None
+        px = float(sel.iloc[-1])
+        used_date = sel.index[-1].date()
+        if px <= 0 or not np.isfinite(px):
+            return None
+        return (px, used_date)
+    except Exception:
+        return None
+
+
+def _compute_baseline_comparison(env: dict, plan_id: int, target: date) -> Dict:
+    """算一套方案「如果现在这些股数是那天的收盘价」的市值 vs 现在市值。
+    返回 {"ok", "base_total", "cur_total", "pct"(None=算不出), "failed"(取价失败的代码),
+          "n"(持仓笔数), "used_dates"(实际用到的交易日集合)}。纯计算，不碰UI。"""
+    positions = PaperWatchlistStore.list_positions(plan_id)
+    if not positions:
+        return {"ok": False, "base_total": 0.0, "cur_total": 0.0, "pct": None,
+                "failed": [], "n": 0, "used_dates": set()}
+    fetch = env["fetch_stock_data"]; get_rt = env["get_realtime_price"]
+    base_total = cur_total = 0.0
+    failed: List[str] = []
+    used_dates = set()
+    for p in positions:
+        res = _price_asof(fetch, p["symbol"], target)
+        cur_price = get_rt(p["symbol"])
+        if cur_price is None:
+            try:
+                df = fetch(p["symbol"], "5d")
+                cur_price = float(df["Close"].iloc[-1]) if df is not None and not df.empty else None
+            except Exception:
+                cur_price = None
+        if res is None or cur_price is None:
+            failed.append(p["symbol"])
+            continue
+        hist_price, used_date = res
+        used_dates.add(used_date)
+        base_total += p["qty"] * hist_price
+        cur_total += p["qty"] * cur_price
+    pct = ((cur_total - base_total) / base_total * 100.0) if base_total > 0 else None
+    return {"ok": base_total > 0, "base_total": base_total, "cur_total": cur_total,
+            "pct": pct, "failed": failed, "n": len(positions), "used_dates": used_dates}
+
+
+class BaselineCompareAllDialog(QDialog):
+    """「方案综合对比」—— 每套方案各自用自己保存的对比基准日横向比一遍，
+    一眼看出哪套方案从各自基准日算到现在涨得最多/最少。没设过基准日的方案
+    按"今天"处理（即0%，等于还没开始对比）。"""
+
+    def __init__(self, env: dict, parent=None):
+        super().__init__(parent)
+        self.env = env
+        T = env["T"]
+        self.setWindowTitle("方案综合对比 — 基准日")
+        try: self.setWindowIcon(env["_make_app_icon"]())
+        except Exception: pass
+        self.setStyleSheet(env.get("GLOBAL_STYLE", ""))
+        self.resize(780, 440)
+
+        lay = QVBoxLayout(self)
+        hint = QLabel(
+            "每套方案按各自在「持仓明细」页顶部设置的「对比基准日」折算：\n"
+            "用该方案现在的持仓数量，分别按基准日收盘价和现价估值，算涨跌%。\n"
+            "还没设置过基准日的方案按「今天」显示（0%，等于还没开始对比）。")
+        hint.setWordWrap(True); hint.setStyleSheet(f"color:{T.TEXT_2};font-size:8pt;")
+        lay.addWidget(hint)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["方案", "基准日", "基准市值", "现市值", "涨跌%", "备注"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        lay.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("刷新"); refresh_btn.clicked.connect(self._reload)
+        close_btn = QPushButton("关闭"); close_btn.clicked.connect(self.accept)
+        btn_row.addStretch(); btn_row.addWidget(refresh_btn); btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        self._reload()
+
+    def _reload(self):
+        T = self.env["T"]
+        self.setCursor(Qt.WaitCursor)
+        try:
+            plans = PaperWatchlistStore.list_plans()
+            rows = []
+            for p in plans:
+                saved = PaperWatchlistStore.get_compare_date(p["id"])
+                target = date.today()
+                if saved:
+                    try:
+                        target = datetime.strptime(saved, "%Y-%m-%d").date()
+                    except Exception:
+                        target = date.today()
+                try:
+                    res = _compute_baseline_comparison(self.env, p["id"], target)
+                except Exception as e:
+                    logger.warning(f"基准日综合对比 {p['name']}: {e}")
+                    res = {"ok": False, "base_total": 0.0, "cur_total": 0.0, "pct": None,
+                           "failed": [], "n": 0, "used_dates": set()}
+                rows.append((p, target, res))
+        finally:
+            self.unsetCursor()
+
+        rows.sort(key=lambda r: (r[2]["pct"] is None, -(r[2]["pct"] or 0.0)))
+        self.table.setRowCount(0)
+        for p, target, res in rows:
+            row = self.table.rowCount(); self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(p["name"]))
+            self.table.setItem(row, 1, QTableWidgetItem(target.strftime("%Y-%m-%d")))
+            if res["ok"] and res["pct"] is not None:
+                self.table.setItem(row, 2, QTableWidgetItem(f"${res['base_total']:,.2f}"))
+                self.table.setItem(row, 3, QTableWidgetItem(f"${res['cur_total']:,.2f}"))
+                pct = res["pct"]
+                pct_item = QTableWidgetItem(f"{pct:+.2f}%")
+                pct_item.setForeground(QColor(T.GREEN if pct >= 0 else T.RED))
+                self.table.setItem(row, 4, pct_item)
+                note = f"⚠ 取价失败: {', '.join(res['failed'])}" if res["failed"] else ""
+                self.table.setItem(row, 5, QTableWidgetItem(note))
+            else:
+                for col in (2, 3, 4):
+                    self.table.setItem(row, col, QTableWidgetItem("—"))
+                note = "还没有持仓" if res["n"] == 0 else "历史价格取不到"
+                self.table.setItem(row, 5, QTableWidgetItem(note))
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -638,7 +958,7 @@ class EditPositionDialog(QDialog):
         save_btn = QPushButton("保存"); save_btn.setStyleSheet(f"background:{T.GREEN};color:white;")
         save_btn.clicked.connect(self._save)
         cancel_btn = QPushButton("取消"); cancel_btn.clicked.connect(self.reject)
-        btn_row.addStretch(); btn_row.addWidget(cancel_btn); btn_row.addWidget(save_btn)
+        btn_row.addStretch(); btn_row.addWidget(save_btn); btn_row.addWidget(cancel_btn)
         v.addLayout(btn_row)
 
     def _fill_current_price(self):
@@ -804,7 +1124,6 @@ def _build_diagnosis_report(plan_name: str, agg: Dict[str, Dict], ai_results: Di
 
     # ② 对比大盘
     if len(snaps) >= 2 and bench_pct is not None:
-        plan_pct = snaps[-1]["pnl_pct"] - snaps[0]["pnl_pct"] + snaps[0]["pnl_pct"]  # 用最新快照收益
         plan_pct = snaps[-1]["pnl_pct"]
         diff = plan_pct - bench_pct
         verdict = "跑赢" if diff >= 0 else "跑输"
@@ -992,7 +1311,7 @@ class LLMSettingsDialog(QDialog):
         btn_row = QHBoxLayout()
         save_btn = QPushButton("保存"); save_btn.clicked.connect(self._save)
         cancel_btn = QPushButton("取消"); cancel_btn.clicked.connect(self.reject)
-        btn_row.addStretch(); btn_row.addWidget(cancel_btn); btn_row.addWidget(save_btn)
+        btn_row.addStretch(); btn_row.addWidget(save_btn); btn_row.addWidget(cancel_btn)
         v.addLayout(btn_row)
 
     def _save(self):
@@ -1057,6 +1376,33 @@ class PaperWatchlistDialog(QDialog):
         self.summary_lbl.setStyleSheet(f"color:{T.TEXT_H};font-size:11pt;padding:4px;")
         right.addWidget(self.summary_lbl)
 
+        # ── 对比基准日：把日期改成历史某一天，按现在的持仓数量折算那天市值，
+        # 跟现价市值比涨跌%——跟持仓真实买入价/买入日期无关，独立的回溯对比。
+        # 每套方案各自记一个基准日，切方案自动读回各自保存的那天。
+        base_row = QHBoxLayout()
+        base_row.addWidget(QLabel("对比基准日:"))
+        self.base_date_edit = QDateEdit(QDate.currentDate())
+        self.base_date_edit.setCalendarPopup(True)
+        self.base_date_edit.setMaximumDate(QDate.currentDate())
+        self.base_date_edit.setEnabled(False)  # 没选方案前禁用，避免误触发取数
+        self.base_date_edit.dateChanged.connect(self._on_base_date_changed)
+        base_row.addWidget(self.base_date_edit)
+        self.base_compare_lbl = QLabel("")
+        self.base_compare_lbl.setStyleSheet(f"color:{T.TEXT_H};")
+        self.base_compare_lbl.setWordWrap(True)
+        base_row.addWidget(self.base_compare_lbl, 1)
+        compare_all_btn = QPushButton("方案综合对比")
+        compare_all_btn.setToolTip("每套方案各自用自己保存的基准日横向比一遍，看哪套涨得最多/最少")
+        compare_all_btn.setStyleSheet(f"color:{T.ACCENT};border-color:{T.ACCENT};")
+        compare_all_btn.clicked.connect(self._open_compare_all)
+        base_row.addWidget(compare_all_btn)
+        right.addLayout(base_row)
+        base_hint = QLabel("改日期＝把这套方案现在的持仓「倒回那天」估值，跟现价比涨跌；"
+                           "每套方案的基准日会自动记住，方案之间互不影响。")
+        base_hint.setWordWrap(True); base_hint.setStyleSheet(f"color:{T.TEXT_2};font-size:8pt;")
+        right.addWidget(base_hint)
+        self._base_date_timer: Optional[QTimer] = None
+
         self.tabs = QTabWidget()
         right.addWidget(self.tabs, 1)
 
@@ -1095,6 +1441,7 @@ class PaperWatchlistDialog(QDialog):
         self.pos_table.setHorizontalHeaderLabels(
             ["排名", "代码", "名称", "数量", "买入价", "买入日期", "现价", "仓位占比%",
              "现值", "浮动盈亏", "盈亏%", "持有天数"])
+        self.pos_table.setIconSize(QSize(20, 20))
         self.pos_table.horizontalHeader().setStretchLastSection(True)
         self.pos_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.pos_table.setEditTriggers(QAbstractItemView.NoEditTriggers)  # 单元格本身不可直接改，双击弹编辑框
@@ -1103,6 +1450,10 @@ class PaperWatchlistDialog(QDialog):
         hint = QLabel("双击某一行，或选中后点「编辑数量/价格」— 建仓后填错了可以改。")
         hint.setStyleSheet(f"color:{T.TEXT_2};font-size:8pt;")
         hold_l.addWidget(hint)
+        if HAS_LOGOS:
+            logo_attr = QLabel(_tlogos.attribution_html())
+            logo_attr.setOpenExternalLinks(True)
+            hold_l.addWidget(logo_attr)
 
         bottom_row = QHBoxLayout()
         edit_pos_btn = QPushButton("编辑数量/价格"); edit_pos_btn.setStyleSheet(f"color:{T.GOLD};border-color:{T.GOLD};")
@@ -1112,8 +1463,13 @@ class PaperWatchlistDialog(QDialog):
         refresh_btn = QPushButton("刷新价格 / 记录快照")
         refresh_btn.setStyleSheet(f"background:{T.ACCENT};color:white;")
         refresh_btn.clicked.connect(self._refresh_prices)
+        backfill_btn = QPushButton("补录快照缺口")
+        backfill_btn.setToolTip("没打开软件的那几天走势图会断档；这里用历史行情倒算补上\n"
+                                 "（前提：缺口期间持仓没变过，否则只能按现在的持仓近似）")
+        backfill_btn.setStyleSheet(f"color:{T.ACCENT};border-color:{T.ACCENT};")
+        backfill_btn.clicked.connect(self._backfill_snapshots)
         bottom_row.addWidget(edit_pos_btn); bottom_row.addWidget(del_pos_btn)
-        bottom_row.addStretch(); bottom_row.addWidget(refresh_btn)
+        bottom_row.addStretch(); bottom_row.addWidget(backfill_btn); bottom_row.addWidget(refresh_btn)
         hold_l.addLayout(bottom_row)
         self.tabs.addTab(hold_w, "持仓明细")
 
@@ -1318,20 +1674,99 @@ class PaperWatchlistDialog(QDialog):
             self.pos_table.setRowCount(0)
             self.summary_lbl.setText("还没有方案 — 点左边「新建空方案」或「一键建仓」")
             self.plan_note_lbl.setText("")
+            self.base_date_edit.setEnabled(False)
+            self.base_compare_lbl.setText("")
 
     def _update_plan_pnl_badge(self):
         """持仓有变动/刷新价格后调用：重算当前方案的涨幅%，左侧列表徽章+排序跟着刷新。"""
         if self.cur_plan_id is None: return
         self._plan_pnl_cache[self.cur_plan_id] = self._compute_plan_pnl_pct(self.cur_plan_id)
         self._reload_plans(select_id=self.cur_plan_id)
+        self._recompute_base_compare()  # 持仓数量/价格变了，基准日对比也要跟着重算
+
+    # ── 对比基准日 ────────────────────────────────────────────
+    def _on_base_date_changed(self, _qdate):
+        if self.cur_plan_id is None:
+            return
+        date_str = self.base_date_edit.date().toString("yyyy-MM-dd")
+        PaperWatchlistStore.set_compare_date(self.cur_plan_id, date_str)
+        # 轻量防抖：日历控件里连续点几下/输入几位数字时，别每次改动都触发一次网络取价
+        if self._base_date_timer is None:
+            self._base_date_timer = QTimer(self)
+            self._base_date_timer.setSingleShot(True)
+            self._base_date_timer.timeout.connect(self._recompute_base_compare)
+        self._base_date_timer.start(250)
+
+    def _recompute_base_compare(self):
+        if self.cur_plan_id is None:
+            self.base_compare_lbl.setText("")
+            return
+        T = self.T
+        target = self.base_date_edit.date().toPyDate()
+        self.setCursor(Qt.WaitCursor)
+        try:
+            res = _compute_baseline_comparison(self.env, self.cur_plan_id, target)
+        except Exception as e:
+            logger.error(f"基准日对比计算失败: {e}", exc_info=True)
+            self.base_compare_lbl.setText(f"基准日对比计算失败: {e}")
+            return
+        finally:
+            self.unsetCursor()
+
+        if res["n"] == 0:
+            self.base_compare_lbl.setText("这套方案还没有持仓")
+            return
+        if not res["ok"] or res["pct"] is None:
+            msg = "该日期取不到可用的历史价格"
+            if res["failed"]:
+                msg += f"（{', '.join(res['failed'])} 都取价失败）"
+            self.base_compare_lbl.setText(msg)
+            return
+
+        pct = res["pct"]
+        color = T.GREEN if pct >= 0 else T.RED
+        used_dates = res["used_dates"]
+        actual_note = ""
+        # target不是交易日时会自动取最近一个交易日；只有一套持仓全用同一天时才
+        # 报出具体是哪天，避免多标的日期不完全对齐时报一堆日期反而看着乱。
+        if len(used_dates) == 1:
+            only_date = next(iter(used_dates))
+            if only_date != target:
+                actual_note = f"（该日非交易日，已按最近交易日 {only_date.strftime('%Y-%m-%d')} 收盘价折算）"
+        text = (f"基准日({target.strftime('%Y-%m-%d')})市值 <b>${res['base_total']:,.2f}</b>　"
+                f"现市值 <b>${res['cur_total']:,.2f}</b>　"
+                f"<b style='color:{color}'>{pct:+.2f}%</b>{actual_note}")
+        if res["failed"]:
+            text += f"　⚠部分标的取价失败: {', '.join(res['failed'])}"
+        self.base_compare_lbl.setText(text)
+
+    def _open_compare_all(self):
+        dlg = BaselineCompareAllDialog(self.env, parent=self)
+        dlg.exec_()
 
     def _on_plan_changed(self, cur, _prev):
         if cur is None:
-            self.cur_plan_id = None; return
+            self.cur_plan_id = None
+            self.base_date_edit.setEnabled(False)
+            self.base_compare_lbl.setText("")
+            return
         p = cur.data(Qt.UserRole)
         same_plan = (self.cur_plan_id == p["id"])  # 只是徽章刷新触发的"重选同一方案"，别清掉AI/诊断结果
         self.cur_plan_id = p["id"]
         self.plan_note_lbl.setText(p.get("note") or "")
+
+        # 回填这套方案自己保存的对比基准日（没存过就默认今天）；blockSignals避免
+        # setDate触发_on_base_date_changed去多余地保存+取数一遍。
+        saved = PaperWatchlistStore.get_compare_date(p["id"])
+        qd = QDate.fromString(saved, "yyyy-MM-dd") if saved else QDate()
+        if not qd.isValid():
+            qd = QDate.currentDate()
+        self.base_date_edit.blockSignals(True)
+        self.base_date_edit.setEnabled(True)
+        self.base_date_edit.setDate(qd)
+        self.base_date_edit.blockSignals(False)
+        self._recompute_base_compare()
+
         self._reload_positions()
         self._refresh_chart()
         if not same_plan:
@@ -1488,7 +1923,10 @@ class PaperWatchlistDialog(QDialog):
             rank_item.setData(Qt.UserRole, r["id"])
             if r["price_ok"]: rank_item.setForeground(QColor(color))
             self.pos_table.setItem(row, 0, rank_item)
-            self.pos_table.setItem(row, 1, QTableWidgetItem(r["symbol"]))
+            sym_item = QTableWidgetItem(r["symbol"])
+            if HAS_LOGOS:
+                sym_item.setIcon(_tlogos.get_or_fallback_icon(r["symbol"], 20))
+            self.pos_table.setItem(row, 1, sym_item)
             self.pos_table.setItem(row, 2, QTableWidgetItem(r["name"]))
             self.pos_table.setItem(row, 3, QTableWidgetItem(f"{r['qty']:g}"))
             self.pos_table.setItem(row, 4, QTableWidgetItem(f"{cur}{r['buy_price']:.2f}"))
@@ -1509,6 +1947,7 @@ class PaperWatchlistDialog(QDialog):
 
         self.pos_table.resizeColumnsToContents()
         self.pos_table.horizontalHeader().setStretchLastSection(True)
+        self._start_logo_loading()
 
         if positions:
             total_pnl = total_value - total_cost
@@ -1523,6 +1962,43 @@ class PaperWatchlistDialog(QDialog):
             self.summary_lbl.setText("这套方案还没有持仓 — 在上面添加，或用「一键建仓」")
         self._pending_snapshot = (total_cost, total_value) if positions else None
 
+    # ── 持仓表格logo：后台加载，不卡UI线程 ──────────────────
+    def _start_logo_loading(self):
+        if not HAS_LOGOS:
+            return
+        old = getattr(self, "_logo_thread", None)
+        if old is not None and old.isRunning():
+            old.quit(); old.wait(200)
+        symbols = [self.pos_table.item(r, 1).text() for r in range(self.pos_table.rowCount())
+                   if self.pos_table.item(r, 1) is not None]
+        if not symbols:
+            return
+        th = _tlogos.LogoLoaderThread(symbols, parent=self)
+        th.loaded.connect(self._on_logo_loaded)
+        th.missing.connect(self._on_logo_missing)
+        # 线程结束后清空引用，避免 closeEvent 访问已删除对象
+        th.finished_all.connect(lambda: setattr(self, '_logo_thread', None))
+        self._logo_thread = th
+        th.start()
+
+    def _on_logo_loaded(self, symbol, data):
+        pm = _tlogos.pixmap_from_bytes(data, 20)
+        if pm is None:
+            return
+        _tlogos.cache_pixmap(symbol, 20, pm)
+        self._apply_logo_icon(symbol, QIcon(pm))
+
+    def _on_logo_missing(self, symbol):
+        pm = _tlogos.make_fallback_icon(symbol, 20)
+        _tlogos.cache_pixmap(symbol, 20, pm)
+        self._apply_logo_icon(symbol, QIcon(pm))
+
+    def _apply_logo_icon(self, symbol, icon):
+        for r in range(self.pos_table.rowCount()):
+            it = self.pos_table.item(r, 1)
+            if it is not None and it.text().upper() == symbol.upper():
+                it.setIcon(icon)
+
     def _refresh_prices(self):
         if self.cur_plan_id is None:
             QMessageBox.information(self, "提示", "请先选中一套方案"); return
@@ -1532,6 +2008,27 @@ class PaperWatchlistDialog(QDialog):
             PaperWatchlistStore.record_snapshot(self.cur_plan_id, total_cost, total_value)
         self._refresh_chart()
         self._update_plan_pnl_badge()
+
+    def _backfill_snapshots(self):
+        if self.cur_plan_id is None:
+            QMessageBox.information(self, "提示", "请先选中一套方案"); return
+        ret = QMessageBox.question(
+            self, "补录快照缺口",
+            "会用 yfinance 历史收盘价，把这段时间没打开软件/没点刷新造成的走势图断档补上。\n\n"
+            "前提：补录区间内持仓构成必须和现在一致（没加过仓/减过仓/换过标的），\n"
+            "否则只能按现在的持仓结构近似，不是精确复原。\n\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        self.setCursor(Qt.WaitCursor)
+        try:
+            result = backfill_paper_snapshots(self.env, self.cur_plan_id)
+        finally:
+            self.unsetCursor()
+        QMessageBox.information(self, "补录结果" if result["ok"] else "补录失败", result["msg"])
+        if result["ok"] and result["filled"]:
+            self._refresh_chart()
+            self._update_plan_pnl_badge()
 
     # ── 收益走势图（含 ^GSPC 同期基准对比）──────────────────
     def _refresh_chart(self):
@@ -1957,16 +2454,27 @@ class PaperWatchlistDialog(QDialog):
         self._hist_llm_thread = None
 
     def closeEvent(self, event):
-        if self._ai_thread is not None and self._ai_thread.isRunning():
-            self._ai_thread.stop()
-            self._ai_thread.wait(3000)
-        if getattr(self, "_llm_thread", None) is not None and self._llm_thread.isRunning():
-            self._llm_thread.wait(1000)
-        if getattr(self, "_hist_ai_thread", None) is not None and self._hist_ai_thread.isRunning():
-            self._hist_ai_thread.stop()
-            self._hist_ai_thread.wait(3000)
-        if getattr(self, "_hist_llm_thread", None) is not None and self._hist_llm_thread.isRunning():
-            self._hist_llm_thread.wait(1000)
+        # 安全停止所有后台线程
+        threads = [
+            ('_ai_thread', True, 3000),
+            ('_llm_thread', False, 1000),
+            ('_hist_ai_thread', True, 3000),
+            ('_hist_llm_thread', False, 1000),
+            ('_logo_thread', False, 1000),
+        ]
+        for name, has_stop, wait_ms in threads:
+            th = getattr(self, name, None)
+            if th is None:
+                continue
+            try:
+                if th.isRunning():
+                    if has_stop and hasattr(th, 'stop'):
+                        th.stop()
+                    th.wait(wait_ms)
+            except RuntimeError:
+                pass
+            setattr(self, name, None)
+
         super().closeEvent(event)
 
 
@@ -2039,6 +2547,35 @@ if __name__ == "__main__":
     PaperWatchlistStore.record_snapshot(pid, total_cost, total_cost * 1.08)  # 同日覆盖，不应变成2条
     snaps = PaperWatchlistStore.list_snapshots(pid)
     assert len(snaps) == 1 and abs(snaps[0]["pnl_pct"] - 8.0) < 1e-6, "快照upsert/涨幅计算有误"
+
+    # 1.5) 补录快照缺口 自检
+    def _fetch_backfill(sym, period="6mo"):
+        idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=90)
+        base = {"AAA": 100.0, "BBB": 50.0}.get(sym, 100.0)
+        vals = base + np.arange(len(idx)) * 0.1
+        return pd.DataFrame({"Close": vals}, index=idx)
+
+    pid_bf = PaperWatchlistStore.create_plan("补录自检")
+    bf_buy_date = (date.today() - timedelta(days=15)).isoformat()
+    PaperWatchlistStore.add_position(pid_bf, "AAA", "测试A", 10, 100.0, bf_buy_date)
+    PaperWatchlistStore.add_position(pid_bf, "BBB", "测试B", 4, 50.0, bf_buy_date)
+
+    bf_env = {"fetch_stock_data": _fetch_backfill}
+    bf1 = backfill_paper_snapshots(bf_env, pid_bf)
+    assert bf1["ok"] and bf1["filled"] > 0, f"补录快照失败: {bf1}"
+    bf_snaps = PaperWatchlistStore.list_snapshots(pid_bf)
+    assert len(bf_snaps) == bf1["filled"], "补录条数与快照表实际条数不一致"
+    bf_buy_d = datetime.strptime(bf_buy_date, "%Y-%m-%d").date()
+    for s in bf_snaps:
+        d = datetime.strptime(s["snap_date"], "%Y-%m-%d").date()
+        assert d > bf_buy_d, "补录日期不应早于/等于建仓日"
+        assert d < date.today(), "补录日期不应晚于/等于今天（今天留给正常刷新）"
+    # 再补一次 —— 起点会推进到已有最后一条快照之后，应识别为无缺口
+    bf2 = backfill_paper_snapshots(bf_env, pid_bf)
+    assert bf2["ok"] and bf2["filled"] == 0, "重复补录未能正确识别为「无缺口」"
+    print(f"补录快照自检通过 ✓ 首次补{bf1['filled']}条，二次补录识别无缺口={bf2['filled']==0}")
+    PaperWatchlistStore.delete_plan(pid_bf)  # 清理，避免影响后面"删除方案后应清零"的自检
+
 
     # 2) 编辑持仓（改数量/买入价/买入日期）是否生效
     PaperWatchlistStore.update_position(positions[0]["id"], 20, 160.0, "2026-06-15")
@@ -2132,7 +2669,7 @@ if __name__ == "__main__":
         {"snap_date": "2026-06-01", "total_cost": 1000.0, "total_value": 1000.0, "pnl_pct": 0.0},
         {"snap_date": "2026-07-01", "total_cost": 1000.0, "total_value": 1050.0, "pnl_pct": 5.0},
     ]
-    _colors = {"green": "#10b981", "red": "#ef4444", "gold": "#f59e0b", "text2": "#8ba3be"}
+    _colors = {"green": "#16a34a", "red": "#dc2626", "gold": "#a9822f", "text2": "#6d7d70"}
     html = _build_diagnosis_report("测试方案", _agg, _ai_results_fake, _snaps_fake, 3.0, _colors)
     assert "测试方案" in html and "AAA" in html and "跑赢" in html, "诊断报告HTML内容不完整"
     plain = _diagnosis_report_plaintext(_ai_results_fake, "测试方案", _agg, 1000.0, 1050.0, 3.0)
@@ -2163,10 +2700,10 @@ if __name__ == "__main__":
 
     # 3) 窗口冒烟（合成价格，不联网）
     class _T:
-        BG0='#070d14'; BG1='#0d1826'; BG2='#111f30'; BORDER='#1e3452'
-        GOLD='#f59e0b'; ACCENT='#0ea5e9'; CYAN='#06b6d4'; GREEN='#10b981'; RED='#ef4444'
-        TEXT_H='#e2eaf3'; TEXT_1='#c8d8e8'; TEXT_2='#8ba3be'; TEXT_3='#4e6a82'
-        MPL_BG='#070d14'; MPL_AXES='#0d1826'
+        BG0='#f4f7f2'; BG1='#ffffff'; BG2='#ffffff'; BORDER='#dde5db'
+        GOLD='#a9822f'; ACCENT='#1b7a43'; CYAN='#0f9c9c'; GREEN='#16a34a'; RED='#dc2626'
+        TEXT_H='#16241a'; TEXT_1='#33413a'; TEXT_2='#6d7d70'; TEXT_3='#9aab9c'
+        MPL_BG='#ffffff'; MPL_AXES='#fbfdf9'
 
     def _style(ax, title="", xlabel="", ylabel=""):
         ax.set_facecolor(_T.MPL_AXES); ax.set_title(title, color=_T.TEXT_H, fontsize=9)
@@ -2285,4 +2822,5 @@ if __name__ == "__main__":
     for f in (PaperWatchlistStore._DB_PATH, "quantpro_paper_selftest.db", "quantpro_paper_selftest2.db"):
         try: os.remove(f)
         except Exception: pass
+    dlg.close(); dlg2.close()  # 触发 closeEvent，等后台logo线程收尾，避免退出时 QThread 未结束报错
     print("全部自检通过 ✓")
