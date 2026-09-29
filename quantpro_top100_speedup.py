@@ -9,6 +9,13 @@ QuantPro — 美股 Top100 扫描提速补丁  v1.0
   ② _on_scan_done 又对 100 只股票串行重新下载 1y（缓存 key 是 _10y，根本不命中）
   ③ 扫描开头 10 个线程同时冷启动去拉 SPY 1mo（惊群）
   ④ 扫描完成后 logo 线程串行、每只最多 3 次请求(4~5s 超时)
+  ⑤ 【第二次扫描依旧慢的真正元凶】v15 把 ProbabilityEngine.detect_regime 换成
+     AdvancedRegimeDetector.current_regime，里面的 BOCPD 是 O(n²) 纯 Python 双重循环，
+     每一步还逐点调 scipy.stats.t.pdf（~62 万次调用）：单只股票约 18 秒，100 只≈半小时，
+     与网络无关、每次扫描都重算。而 detect_regime 只取 regime 标签，
+     BOCPD 算出的 cp_recent 根本没被使用 → 白算。
+     另外 v15 用一个全局 _global_detector，10 个扫描线程同时 fit() 会互相覆盖
+     _labels/_cluster_model（线程不安全）。
 
 本补丁：扫描前用「单次线程内的批量 yf.download」一次性预热 10y 缓存，
        _analyze 里的 fetch_stock_data 全部命中缓存。
@@ -93,6 +100,48 @@ def prewarm_cache(env: dict, syms: List[str], period: str = "10y", progress_cb=N
     return got
 
 
+def _install_fast_regime(env: dict):
+    """替换 ProbabilityEngine.detect_regime：每次调用用独立检测器（线程安全），
+    并跳过结果不会被使用的 BOCPD。regime 标签的判定逻辑与 v15 原实现完全一致。"""
+    import numpy as np
+    from scipy import stats as _st
+    ARD = env.get("AdvancedRegimeDetector")
+    PE = env.get("ProbabilityEngine")
+    if ARD is None or PE is None or getattr(PE, "_regime_fast_patched", False):
+        return
+    try:
+        from sklearn.preprocessing import StandardScaler
+    except Exception:
+        return
+    _prev_detect = PE.detect_regime          # v15 增强版（异常时回退用）
+
+    def _fast_detect_regime(self):
+        try:
+            close = self.close
+            det = ARD()                       # 独立实例：不与其它线程共享状态
+            det.fit(close)
+            if det._cluster_model is None:
+                return "neutral"
+            feats = det._build_features(close, None)
+            if feats.empty:
+                return "neutral"
+            X = StandardScaler().fit_transform(feats.values)
+            dists = np.linalg.norm(X - X[-1].reshape(1, -1), axis=1)
+            knn_labels = det._labels[np.argsort(dists)[:20]]
+            cid = int(_st.mode(knn_labels, keepdims=False).mode)
+            reg = det._label_map.get(cid, "neutral")
+            if reg in ("crisis", "volatile"): return "high_vol"
+            if reg in ("calm_bull", "calm_bear"): return "low_vol"
+            return "neutral"
+        except Exception as e:
+            logger.warning(f"[top100_speedup] fast regime 回退: {e}")
+            return _prev_detect(self)
+
+    PE.detect_regime = _fast_detect_regime
+    PE._regime_fast_patched = True
+    logger.info("[top100_speedup] 已替换 detect_regime：跳过无用的 BOCPD + 线程安全")
+
+
 def install_top100_speedup(env: dict):
     for k in ("AnalysisThread", "_data_cache", "_cache_lock", "_normalize", "fetch_stock_data"):
         if k not in env:
@@ -115,6 +164,7 @@ def install_top100_speedup(env: dict):
 
     AT.run = _run
     AT._speedup_patched = True
+    _install_fast_regime(env)
     logger.info("[top100_speedup] 已安装：扫描前批量预热行情缓存")
     return AT
 
