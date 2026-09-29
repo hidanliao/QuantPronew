@@ -30,6 +30,8 @@ QuantPro — 股票 Logo 获取 / 缓存 / 兜底  v1.0
 from __future__ import annotations
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -87,9 +89,16 @@ def _load_domain_cache() -> None:
 _load_domain_cache()
 
 
+_domain_lock = threading.Lock()
+_defer_save = False   # 批量加载期间置 True，结束后统一写一次盘（原来每解析一只写一次）
+
+
 def _save_domain_cache() -> None:
+    if _defer_save:
+        return
     try:
-        _DOMAIN_MAP_FILE.write_text(json.dumps(_domain_cache, ensure_ascii=False), encoding="utf-8")
+        with _domain_lock:
+            _DOMAIN_MAP_FILE.write_text(json.dumps(_domain_cache, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         logger.warning(f"logo domain cache save fail: {e}")
 
@@ -194,16 +203,27 @@ class LogoLoaderThread(QThread):
         self._tickers = list(dict.fromkeys(t for t in tickers if t))  # 去重保序
 
     def run(self):
-        for t in self._tickers:
-            try:
-                data = fetch_logo_bytes(t)
-            except Exception as e:
-                logger.warning(f"logo load thread error {t}: {e}")
-                data = None
-            if data:
-                self.loaded.emit(t, data)
-            else:
-                self.missing.emit(t)
+        # 并行拉取（原来串行：每只最多 搜索4s + CDN5s + Google5s，100只最坏要好几分钟）
+        global _defer_save
+        _defer_save = True
+        try:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = {ex.submit(fetch_logo_bytes, t): t for t in self._tickers}
+                for fut in as_completed(futs):
+                    t = futs[fut]
+                    try:
+                        data = fut.result()
+                    except Exception as e:
+                        logger.warning(f"logo load thread error {t}: {e}")
+                        data = None
+                    # 信号统一在本 QThread 里发，避免跨线程发射
+                    if data:
+                        self.loaded.emit(t, data)
+                    else:
+                        self.missing.emit(t)
+        finally:
+            _defer_save = False
+            _save_domain_cache()
         self.finished_all.emit()
 
 

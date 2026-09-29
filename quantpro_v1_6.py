@@ -28,6 +28,7 @@ import logging
 import threading
 import traceback
 import csv
+from pathlib import Path
 import sqlite3
 import json
 import warnings
@@ -439,6 +440,8 @@ def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
 
 def clear_cache():
     with _cache_lock: _data_cache.clear()
+
+SCAN_LIVE_QUOTE = False   # 扫描列表是否逐只拉实时报价（True 会很慢：每只多 2~3 次请求）
 
 _rt_cache: Dict[str, tuple] = {}
 _rt_lock = threading.Lock()
@@ -2698,10 +2701,33 @@ class Top100Loader:
     def get_name(cls,sym,fallback=""):
         return cls.ZH.get(sym, fallback or sym)
 
+    _CACHE_TTL=12*3600
+
+    @classmethod
+    def _cache_file(cls):
+        return Path.home()/".quantpro_cache"/"top100.json"
+
     @classmethod
     def load(cls):
+        # 12 小时内直接读本地缓存（省掉一次在UI线程上的同步网络请求）
         try:
-            resp=requests.get(cls.URL,timeout=10); resp.raise_for_status()
+            fp=cls._cache_file()
+            if fp.exists() and time.time()-fp.stat().st_mtime<cls._CACHE_TTL:
+                cached=json.loads(fp.read_text(encoding="utf-8"))
+                if cached: return [tuple(x) for x in cached]
+        except Exception: pass
+        syms=cls._load_remote()
+        if syms and syms is not cls.FALLBACK:
+            try:
+                fp=cls._cache_file(); fp.parent.mkdir(parents=True,exist_ok=True)
+                fp.write_text(json.dumps(syms,ensure_ascii=False),encoding="utf-8")
+            except Exception: pass
+        return syms
+
+    @classmethod
+    def _load_remote(cls):
+        try:
+            resp=requests.get(cls.URL,timeout=(3,5)); resp.raise_for_status()
             data=csv.DictReader(StringIO(resp.text)); syms,seen=[],set()
             for row in data:
                 sym=row.get("symbol","").strip().upper()
@@ -2877,7 +2903,10 @@ class AnalysisThread(QThread):
             ind=TechnicalIndicators.compute_all(df)
             if ind.empty: return None
             lat=ind.iloc[-1]; hist_close=float(lat['close'])
-            rp=get_realtime_price(sym)
+            # 【提速】批量扫描默认直接用 10y 日线最后一根K线（Yahoo 日线末根盘中即为最新价），
+            # 不再为每只股票额外创建 Ticker 调 fast_info/info（每只≈2~3次额外请求，100只=200+次）。
+            # 需要逐只精确实时价时，把 SCAN_LIVE_QUOTE 改成 True。
+            rp=get_realtime_price(sym) if SCAN_LIVE_QUOTE else None
             if rp is not None:
                 close=rp; prev=None
                 try:
@@ -2889,7 +2918,7 @@ class AnalysisThread(QThread):
                 chg=(close-float(prev))/float(prev)*100
             else:
                 close=hist_close; chg=float(lat['chg_pct'])
-                self.error_msg.emit(t("err_live_price",sym=sym))
+                if SCAN_LIVE_QUOTE: self.error_msg.emit(t("err_live_price",sym=sym))
 
             rsi=float(lat['rsi']); ma20=float(lat['ma20']); ma60=float(lat['ma60'])
             macd=float(lat['macd']); vol_r=float(lat['volume_ratio']); atr=float(lat['atr'])
@@ -4527,15 +4556,17 @@ class QuantApp(QWidget):
     def _on_scan_done(self,n):
         self.progress.setVisible(False); self._set_busy(False)
         self.table.resizeColumnsToContents(); self.table.horizontalHeader().setStretchLastSection(True)
-        # 在后台下载数据用于横截面分析
+        # 【提速】横截面分析直接复用扫描时已缓存的 10y 数据切最近一年，零网络请求
+        # （原来这里对每只股票串行重新下载 1y，100 只要再等好几分钟，
+        #   而且 3 秒后就算排名，此时数据根本没下完）
         syms=[r.get('col_code','') for r in self.scan_model._rows if r.get('col_code','')]
-        def _prefetch():
-            for sym in syms:
-                df=fetch_stock_data(sym,"1y")
-                if not df.empty: self._syms_data[sym]=df
-        threading.Thread(target=_prefetch,daemon=True).start()
-        # 计算横截面排名
-        QTimer.singleShot(3000, self._update_cs_ranks)
+        for sym in syms:
+            key=f"{_normalize(sym)}_10y"
+            with _cache_lock: full=_data_cache.get(key)
+            if full is None or full.empty: continue
+            cut=full.index[-1]-pd.DateOffset(years=1)
+            self._syms_data[sym]=full[full.index>=cut]
+        QTimer.singleShot(0, self._update_cs_ranks)
         self.status_bar.showMessage(t("status_done_scan",n=n))
 
     def _update_cs_ranks(self):
@@ -4877,6 +4908,14 @@ if __name__ == "__main__":
         install_ai_commentary(globals())
     except ImportError as _e:
         logger.warning(f"AI分析师未加载（缺文件 quantpro_ai_commentary.py）: {_e}")
+
+    # ── ⑩.6 美股 Top100 扫描提速（批量预热行情缓存）───────────────
+    #      只包装 AnalysisThread.run，与其它补丁互不冲突，放在创建窗口前即可
+    try:
+        from quantpro_top100_speedup import install_top100_speedup
+        install_top100_speedup(globals())
+    except ImportError as _e:
+        logger.warning(f"Top100提速未加载（缺文件 quantpro_top100_speedup.py）: {_e}")
 
     # ── ⑪ 创建主窗口 ────────────────────────────────────────────
     win = QuantApp()
