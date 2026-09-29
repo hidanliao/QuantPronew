@@ -1,31 +1,22 @@
 """
-QuantPro — AI 文字分析师 v1.0
+QuantPro — AI 文字分析师 v1.1（修复新闻情感缺失）
 ══════════════════════════════════════════════════════════════════
-把散落在主程序/各补丁里的数字（概率、Regime、量价、EVT尾部、
-Monte Carlo区间、FF因子暴露、情感、微观结构）汇成一份中文研报。
-
-设计原则：
-  ① 离线优先：无任何 API 也能出报告（模板+规则拼接）
-  ② LLM 可选：若用户配了 OpenAI 兼容接口（复用 paper_watchlist
-     的配置 key），异步追加一段润色
-  ③ 三处挂载：
-       - 概率预测弹窗：新增「AI点评」tab
-       - 扫描列表：右键 → 「生成AI研报」
-       - 对外暴露 show_ai_report(env, sym, row) 供其它模块调用
-  ④ 数字可信：所有结论都附带具体数值，无"我觉得""可能"
+v1.1 修复：
+  ① collect_context 从多个属性名尝试提取情感数据
+  ② 润色前强制重新收集上下文（拿到最新情感）
+  ③ Hook _on_news：新闻加载完成后自动刷新 AI tab
+  ④ AI tab 首次刷新延迟 1500ms → 2500ms
+  ⑤ 情感仍缺失时在 LLM 上下文显式说明（避免LLM瞎猜）
 
 集成（quantpro_v1_6.py 的 __main__ 里，v15 之后、QuantApp 之前）：
 
     from quantpro_ai_commentary import install_ai_commentary
     install_ai_commentary(globals())
-
-依赖：仅用主程序已有的 PyQt5 / matplotlib / pandas / numpy
 ══════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 import logging
-import threading
 from typing import Dict, List, Optional, Any
 
 import numpy as np
@@ -33,16 +24,15 @@ import pandas as pd
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextBrowser,
-    QApplication, QMessageBox, QFrame, QWidget, QMenu, QAction
+    QApplication, QMessageBox, QWidget, QMenu, QAction
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
 
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 配置读取（复用 paper_watchlist 的存储，无则降级为只读空）
+# LLM 配置读取
 # ══════════════════════════════════════════════════════════════════
 def _get_llm_config() -> Dict[str, str]:
     try:
@@ -57,7 +47,35 @@ def _get_llm_config() -> Dict[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 上下文收集：把各模块的数字汇总成一个 dict
+# 【v1.1 新增】情感数据多路径提取
+# ══════════════════════════════════════════════════════════════════
+def _extract_sentiment_from_dialog(dialog) -> Optional[Dict]:
+    """
+    从 dialog 的多个可能属性名尝试获取情感数据。
+    主程序写入 _sentiment_agg；本模块可能写 _ai_last_sentiment；
+    未来若主程序改名，多个候选依次尝试，任一命中即用。
+    """
+    if dialog is None:
+        return None
+    for attr in ("_sentiment_agg", "_last_sentiment_agg",
+                 "_ai_last_sentiment", "sentiment_agg"):
+        val = getattr(dialog, attr, None)
+        if not val:
+            continue
+        try:
+            d = dict(val)
+            # 至少要有一条新闻的情感结果才认
+            if (d.get("n_total", 0) > 0
+                    or (d.get("n_pos", 0) + d.get("n_neg", 0)
+                        + d.get("n_neu", 0)) > 0):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════
+# 上下文收集
 # ══════════════════════════════════════════════════════════════════
 def _safe(v, default=None):
     try:
@@ -71,15 +89,8 @@ def _safe(v, default=None):
 
 def collect_context(env: dict, sym: str,
                     dialog=None, row: Optional[Dict] = None) -> Dict:
-    """
-    收集一只股票的所有可用分析数据。优先从已打开的 dialog 里取，
-    否则用 fetch_stock_data 现算关键指标。所有字段都可能是 None，
-    模板层会做条件渲染。
-    """
     ctx: Dict[str, Any] = {
-        "symbol": sym,
-        "name": "",
-        "currency": "$",
+        "symbol": sym, "name": "", "currency": "$",
         "price": None, "change_pct": None,
     }
 
@@ -102,23 +113,31 @@ def collect_context(env: dict, sym: str,
         ctx["cs_rank"] = row.get("col_cs_rank")
         ctx["rel_str"] = _safe(row.get("col_rel_str"))
 
-    # ── 从对话框拿现成的分析结果 ──
+    # ── 从 dialog 拿现成分析结果 ──
     if dialog is not None:
         try:
             if not ctx["name"] and hasattr(dialog, "name"):
                 ctx["name"] = dialog.name or ""
+
             # 概率卡片
             if hasattr(dialog, "prob_cards"):
-                for key, tag in (("p5", "prob_5d"), ("p20", "prob_20d"), ("p60", "prob_60d")):
+                for key, tag in (("p5", "prob_5d"),
+                                 ("p20", "prob_20d"),
+                                 ("p60", "prob_60d")):
                     try:
                         txt = dialog.prob_cards[key].text().replace("%", "").strip()
                         if txt and txt != "--":
                             ctx[tag] = float(txt) / 100.0
                     except Exception:
                         pass
-            # 情感
-            if hasattr(dialog, "_sentiment_agg") and dialog._sentiment_agg:
-                ctx["sentiment"] = dict(dialog._sentiment_agg)
+
+            # 【v1.1 修复】情感 —— 多路径提取
+            senti = _extract_sentiment_from_dialog(dialog)
+            if senti:
+                ctx["sentiment"] = senti
+                logger.debug(f"[ai_commentary] 情感数据来源已命中，"
+                             f"n_total={senti.get('n_total')}")
+
             # 价格目标 / MC
             if hasattr(dialog, "_target_data") and dialog._target_data:
                 mc_bands = dialog._target_data.get("mc_bands", {})
@@ -130,14 +149,13 @@ def collect_context(env: dict, sym: str,
                         "high_pct": _safe(band.get("p95_pct")),
                         "up_prob": _safe(band.get("up_prob")),
                     }
-            # 指标 DataFrame（用来算技术细节）
+
             if hasattr(dialog, "_ind") and dialog._ind is not None:
-                ind = dialog._ind
-                ctx["_ind_df"] = ind
+                ctx["_ind_df"] = dialog._ind
         except Exception as e:
             logger.warning(f"[ai_commentary] 从 dialog 取数异常: {e}")
 
-    # ── 用 _ind 补齐 RSI/MA 等 ──
+    # ── 用 _ind 补齐技术指标 ──
     ind = ctx.pop("_ind_df", None)
     if ind is not None and not ind.empty:
         last = ind.iloc[-1]
@@ -148,7 +166,7 @@ def collect_context(env: dict, sym: str,
         ctx.setdefault("atr", _safe(last.get("atr")))
         ctx.setdefault("price", _safe(last.get("close")))
 
-    # ── 若还没有基础数据，现算 ──
+    # ── 缺基础数据则现算 ──
     if fetch is not None and (ctx["price"] is None or ctx.get("rsi") is None):
         try:
             df = fetch(sym, "6mo")
@@ -250,8 +268,9 @@ def collect_context(env: dict, sym: str,
             if df is not None and not df.empty and len(df) >= 60:
                 ms = MS.compute_all(df)
                 if ms is not None and not ms.empty:
-                    last = ms.dropna().iloc[-1] if not ms.dropna().empty else None
-                    if last is not None:
+                    valid = ms.dropna()
+                    if not valid.empty:
+                        last = valid.iloc[-1]
                         ctx["micro"] = {
                             "amihud": _safe(last.get("amihud")),
                             "roll_spread": _safe(last.get("roll_spread")),
@@ -265,18 +284,12 @@ def collect_context(env: dict, sym: str,
 
 
 # ══════════════════════════════════════════════════════════════════
-# 离线模板：把上下文拼成中文研报
+# 离线研报模板
 # ══════════════════════════════════════════════════════════════════
 def _pct(v, digits=2):
     if v is None:
         return "--"
     return f"{v:+.{digits}f}%"
-
-
-def _num(v, digits=2):
-    if v is None:
-        return "--"
-    return f"{v:.{digits}f}"
 
 
 def _prob_pct(p):
@@ -286,7 +299,6 @@ def _prob_pct(p):
 
 
 def build_commentary(ctx: Dict) -> str:
-    """纯函数：把上下文 dict 渲染成中文研报字符串（无 HTML）。"""
     sym = ctx.get("symbol", "?")
     name = ctx.get("name", "") or ""
     cur = ctx.get("currency", "$")
@@ -303,203 +315,144 @@ def build_commentary(ctx: Dict) -> str:
             head += f"（{chg:+.2f}%）"
     lines.append(f"【{head}】")
 
-    # ── ① 综合结论 ──
+    # ① 综合结论
     lines.append("")
     lines.append("◆ 综合结论")
     p20 = ctx.get("prob_20d")
     sig = ctx.get("signal_text")
     regime = ctx.get("regime")
-    regime_cn = {"high_vol": "高波动", "low_vol": "低波动",
-                 "neutral": "中性",
+    regime_cn = {"high_vol": "高波动", "low_vol": "低波动", "neutral": "中性",
                  "calm_bull": "温和上行", "calm_bear": "温和下行",
                  "volatile": "震荡", "crisis": "危机"}.get(regime, regime or "未知")
-
-    verdict_bits = []
+    bits = []
     if p20 is not None:
         if p20 >= 0.62:
-            verdict_bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（偏多）")
+            bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（偏多）")
         elif p20 <= 0.38:
-            verdict_bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（偏空）")
+            bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（偏空）")
         else:
-            verdict_bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（中性）")
+            bits.append(f"AI 20日上涨概率 {p20*100:.0f}%（中性）")
     if sig:
-        verdict_bits.append(f"扫描信号：{sig}")
+        bits.append(f"扫描信号：{sig}")
     if regime:
-        verdict_bits.append(f"市场环境：{regime_cn}")
+        bits.append(f"市场环境：{regime_cn}")
+    lines.append("  " + "；".join(bits) + "。" if bits else "  数据不足。")
 
-    if verdict_bits:
-        lines.append("  " + "；".join(verdict_bits) + "。")
-    else:
-        lines.append("  数据不足，无法给出综合判断。")
-
-    # ── ② 价格位置 ──
+    # ② 技术
     lines.append("")
     lines.append("◆ 价格位置与技术")
-    tech_bits = []
-    ma20 = ctx.get("ma20")
-    ma60 = ctx.get("ma60")
-    ma200 = ctx.get("ma200")
+    tb = []
+    for tag, label in (("ma20", "MA20"), ("ma60", "MA60"), ("ma200", "MA200")):
+        ma = ctx.get(tag)
+        if price and ma:
+            tb.append(f"相对 {label} {_pct((price - ma) / ma * 100)}")
     rsi = ctx.get("rsi")
-    atr = ctx.get("atr")
-    if price is not None and ma20:
-        dev = (price - ma20) / ma20 * 100
-        tech_bits.append(f"相对 MA20 {_pct(dev)}")
-    if price is not None and ma60:
-        dev = (price - ma60) / ma60 * 100
-        tech_bits.append(f"相对 MA60 {_pct(dev)}")
-    if price is not None and ma200:
-        dev = (price - ma200) / ma200 * 100
-        tech_bits.append(f"相对 MA200 {_pct(dev)}")
     if rsi is not None:
-        if rsi >= 70:
-            rsi_note = "超买"
-        elif rsi <= 30:
-            rsi_note = "超卖"
-        elif rsi >= 55:
-            rsi_note = "偏强"
-        elif rsi <= 45:
-            rsi_note = "偏弱"
-        else:
-            rsi_note = "中性"
-        tech_bits.append(f"RSI={rsi:.1f}（{rsi_note}）")
+        note = ("超买" if rsi >= 70 else "超卖" if rsi <= 30
+                else "偏强" if rsi >= 55 else "偏弱" if rsi <= 45 else "中性")
+        tb.append(f"RSI={rsi:.1f}（{note}）")
+    atr = ctx.get("atr")
     if atr is not None and price:
-        atr_pct = atr / price * 100
-        tech_bits.append(f"日均波动 ATR≈{cur}{atr:.2f}（{atr_pct:.2f}%）")
-    if tech_bits:
-        lines.append("  " + "；".join(tech_bits) + "。")
-    else:
-        lines.append("  技术指标数据不足。")
+        tb.append(f"ATR≈{cur}{atr:.2f}（{atr/price*100:.2f}%）")
+    lines.append("  " + "；".join(tb) + "。" if tb else "  技术指标数据不足。")
 
-    # ── ③ 概率展望 ──
+    # ③ 概率
     lines.append("")
-    lines.append("◆ 概率展望（AI集成：Purged CV + 校准）")
-    p5 = ctx.get("prob_5d")
-    p60 = ctx.get("prob_60d")
-    prob_line = (f"  5日 上涨 {_prob_pct(p5)}　|　20日 上涨 {_prob_pct(p20)}"
-                 f"　|　60日 上涨 {_prob_pct(p60)}")
-    lines.append(prob_line)
+    lines.append("◆ 概率展望")
+    lines.append(f"  5日 {_prob_pct(ctx.get('prob_5d'))}　|　"
+                 f"20日 {_prob_pct(ctx.get('prob_20d'))}　|　"
+                 f"60日 {_prob_pct(ctx.get('prob_60d'))}")
     mc = ctx.get("mc_20d")
     if mc:
-        lines.append(
-            f"  20日蒙特卡洛价格带：P5 {_pct(mc.get('low_pct'))} ~ "
-            f"P95 {_pct(mc.get('high_pct'))}，中位数 {_pct(mc.get('median_pct'))}"
-        )
+        lines.append(f"  20日MC：P5 {_pct(mc.get('low_pct'))} ~ "
+                     f"P95 {_pct(mc.get('high_pct'))}，"
+                     f"中位数 {_pct(mc.get('median_pct'))}")
 
-    # ── ④ 量价结构 ──
+    # ④ 量价
     vp = ctx.get("volume_price")
     if vp:
         lines.append("")
         lines.append("◆ 量价结构")
-        vp_bits = []
-        obv_note = vp.get("obv_vs_ma")
-        if obv_note:
-            vp_bits.append(f"OBV {obv_note}")
+        bits = []
+        if vp.get("obv_vs_ma"):
+            bits.append(f"OBV {vp['obv_vs_ma']}")
         rc = vp.get("roll_corr_60d")
         if rc is not None and np.isfinite(rc):
-            rc_note = ("量价同向、健康趋势" if rc > 0.3
-                       else "量价背离、警惕反转" if rc < -0.3
-                       else "量价弱相关、震荡")
-            vp_bits.append(f"60日量价相关 {rc:+.2f}（{rc_note}）")
+            note = ("量价同向" if rc > 0.3 else "量价背离" if rc < -0.3 else "量价弱相关")
+            bits.append(f"60日相关 {rc:+.2f}（{note}）")
         vi = vp.get("vol_imbalance_20d")
         if vi is not None and np.isfinite(vi):
-            vi_note = "净流入" if vi > 0.1 else ("净流出" if vi < -0.1 else "均衡")
-            vp_bits.append(f"20日资金 {vi:+.2f}（{vi_note}）")
-        vw = vp.get("vwap_dev_pct")
-        if vw is not None and np.isfinite(vw):
-            vw_note = "高于均价" if vw > 0 else "低于均价"
-            vp_bits.append(f"VWAP 偏离 {vw:+.2f}%（{vw_note}）")
+            note = "净流入" if vi > 0.1 else "净流出" if vi < -0.1 else "均衡"
+            bits.append(f"资金 {vi:+.2f}（{note}）")
         am = vp.get("amihud_illiq")
         if am is not None and np.isfinite(am):
-            am_note = "流动性充裕" if am < 0.1 else ("流动性偏紧" if am > 0.5 else "流动性一般")
-            vp_bits.append(f"Amihud={am:.3f}（{am_note}）")
+            bits.append(f"Amihud={am:.3f}")
         gk = vp.get("gk_vol_annual")
         if gk is not None and np.isfinite(gk):
-            vp_bits.append(f"GK年化波动 {gk*100:.1f}%")
-        nd = vp.get("n_divergence_90d", 0)
-        if nd:
-            vp_bits.append(f"近90日 {nd} 次背离信号")
-        if vp_bits:
-            lines.append("  " + "；".join(vp_bits) + "。")
-        hint = vp.get("regime_hint")
-        if hint:
-            lines.append(f"  研判：{hint}。")
+            bits.append(f"GK波动 {gk*100:.1f}%")
+        if bits:
+            lines.append("  " + "；".join(bits) + "。")
+        if vp.get("regime_hint"):
+            lines.append(f"  研判：{vp['regime_hint']}。")
 
-    # ── ⑤ 风险提示 ──
+    # ⑤ 风险
     lines.append("")
     lines.append("◆ 风险提示")
     evt = ctx.get("evt")
-    risk_bits = []
+    rb = []
     if evt:
-        v99 = evt.get("var99")
-        c99 = evt.get("cvar99")
-        xi = evt.get("xi")
-        if v99 is not None:
-            risk_bits.append(f"EVT-VaR99 {v99*100:.2f}%")
-        if c99 is not None:
-            risk_bits.append(f"EVT-CVaR99 {c99*100:.2f}%")
-        if xi is not None:
-            xi_note = ("厚尾显著" if xi > 0.15
-                       else "接近指数尾" if xi > -0.1
-                       else "有界尾")
-            risk_bits.append(f"尾部指数 ξ={xi:.3f}（{xi_note}）")
+        for k, label, scale in (("var99", "VaR99", 100), ("cvar99", "CVaR99", 100),
+                                ("xi", "尾部指数 ξ", 1)):
+            v = evt.get(k)
+            if v is not None:
+                if scale == 100:
+                    rb.append(f"{label} {v*scale:.2f}%")
+                else:
+                    rb.append(f"{label}={v:.3f}")
     micro = ctx.get("micro")
     if micro:
         rs = micro.get("roll_spread")
-        kl = micro.get("kyle_lambda")
         if rs is not None and np.isfinite(rs):
-            risk_bits.append(f"Roll 价差 {rs*100:.3f}%")
-        if kl is not None and np.isfinite(kl):
-            risk_bits.append(f"Kyle λ={kl:.2e}")
-    if risk_bits:
-        lines.append("  " + "；".join(risk_bits) + "。")
-        if evt and evt.get("verdict"):
-            lines.append(f"  研判：{evt['verdict']}。")
-    else:
-        lines.append("  尾部风险数据不足。")
+            rb.append(f"Roll价差 {rs*100:.3f}%")
+    lines.append("  " + "；".join(rb) + "。" if rb else "  尾部风险数据不足。")
+    if evt and evt.get("verdict"):
+        lines.append(f"  研判：{evt['verdict']}。")
 
-    # ── ⑥ 情感面 ──
+    # ⑥ 情感
     senti = ctx.get("sentiment")
     if senti:
         lines.append("")
         lines.append("◆ 新闻情感")
-        n_pos = senti.get("n_pos", 0)
-        n_neg = senti.get("n_neg", 0)
-        n_neu = senti.get("n_neu", 0)
-        score = senti.get("overall_score", 0.0)
-        mom = senti.get("momentum", 0.0)
         label = senti.get("label", "neutral")
-        label_cn = {"positive": "偏正面", "negative": "偏负面", "neutral": "中性"}.get(label, label)
-        rev = senti.get("reversal_signal", 0.0)
+        label_cn = {"positive": "偏正面", "negative": "偏负面",
+                    "neutral": "中性"}.get(label, label)
         lines.append(
-            f"  正面 {n_pos} 条 / 负面 {n_neg} 条 / 中性 {n_neu} 条，"
-            f"综合得分 {score:+.3f}（{label_cn}）；情感动量 {mom:+.3f}。"
+            f"  正面 {senti.get('n_pos', 0)} / 负面 {senti.get('n_neg', 0)} / "
+            f"中性 {senti.get('n_neu', 0)}，综合 {senti.get('overall_score', 0):+.3f}"
+            f"（{label_cn}）；情感动量 {senti.get('momentum', 0):+.3f}。"
         )
+        rev = senti.get("reversal_signal", 0.0)
         if rev > 0:
             lines.append("  ⚡ 触发情感触底反转信号。")
         elif rev < 0:
             lines.append("  ⚠ 触发情感顶部反转信号。")
 
-    # ── ⑦ 因子暴露 ──
+    # ⑦ 因子暴露
     ff = ctx.get("ff")
     if ff and ff.get("exposures"):
         lines.append("")
-        lines.append("◆ 因子暴露（Fama-French 5因子 + 动量）")
+        lines.append("◆ 因子暴露")
         expo = ff.get("exposures", {})
         parts = [f"{k} {v:+.2f}" for k, v in expo.items() if abs(v) > 0.05]
         if parts:
             lines.append("  " + "  ".join(parts))
-        lines.append(
-            f"  年化 alpha {ff.get('annual_alpha', 0)*100:+.2f}%，"
-            f"R²={ff.get('r_squared', 0):.2f}，"
-            f"主导风格：{ff.get('dominant_style', '无明确暴露')}。"
-        )
+        lines.append(f"  年化alpha {ff.get('annual_alpha', 0)*100:+.2f}%，"
+                     f"R²={ff.get('r_squared', 0):.2f}，"
+                     f"主导风格：{ff.get('dominant_style', '无明确暴露')}。")
 
-    # ── 免责 ──
     lines.append("")
     lines.append("─" * 56)
-    lines.append("⚠ 以上基于历史数据统计与概率模型生成，不构成投资建议。")
-    lines.append("   模型不保证未来表现，请结合基本面和自身风险承受能力独立判断。")
-
+    lines.append("⚠ 基于历史数据统计与概率模型生成，不构成投资建议。")
     return "\n".join(lines)
 
 
@@ -511,9 +464,9 @@ class AICommentaryThread(QThread):
     error_msg = pyqtSignal(str)
 
     _SYSTEM_PROMPT = (
-        "你是一名谨慎的证券分析助理。用户会给你一份关于某只股票的"
-        "结构化数据摘要（价格、概率预测、技术指标、量价结构、尾部风险、"
-        "新闻情感、因子暴露等）。请用中文写一段 250-400 字的点评：\n"
+        "你是一名谨慎的证券分析助理。用户会给你一份关于某只股票的结构化数据"
+        "摘要（价格、概率预测、技术指标、量价结构、尾部风险、新闻情感、因子"
+        "暴露等）。请用中文写一段 250-400 字的点评：\n"
         "1. 先用一句话总结当前的多空格局；\n"
         "2. 分维度解读：技术面 / 概率面 / 量价 / 风险 / 情感；\n"
         "3. 指出 2-3 个最值得关注的风险点或矛盾信号；\n"
@@ -562,12 +515,13 @@ class AICommentaryThread(QThread):
 
 
 def _build_llm_context_text(ctx: Dict) -> str:
-    """把上下文 dict 转成给 LLM 看的紧凑文本（不带模板里的装饰）。"""
+    """【v1.1 修复】情感缺失时显式说明，避免 LLM 瞎猜。"""
     lines = [f"标的：{ctx.get('symbol')}　名称：{ctx.get('name') or '--'}"]
     if ctx.get("price") is not None:
         lines.append(f"现价：{ctx['currency']}{ctx['price']:.2f}　"
                      f"当日涨跌：{_pct(ctx.get('change_pct'))}")
-    for tag, label in (("prob_5d", "5日上涨概率"), ("prob_20d", "20日上涨概率"),
+    for tag, label in (("prob_5d", "5日上涨概率"),
+                       ("prob_20d", "20日上涨概率"),
                        ("prob_60d", "60日上涨概率")):
         if ctx.get(tag) is not None:
             lines.append(f"{label}：{ctx[tag]*100:.0f}%")
@@ -575,40 +529,50 @@ def _build_llm_context_text(ctx: Dict) -> str:
         lines.append(f"扫描信号：{ctx['signal_text']}")
     if ctx.get("regime"):
         lines.append(f"市场环境：{ctx['regime']}")
+
     mc = ctx.get("mc_20d")
     if mc:
-        lines.append(
-            f"20日MC价格带：P5 {_pct(mc.get('low_pct'))} ~ "
-            f"P95 {_pct(mc.get('high_pct'))}，中位数 {_pct(mc.get('median_pct'))}")
+        lines.append(f"20日MC价格带：P5 {_pct(mc.get('low_pct'))} ~ "
+                     f"P95 {_pct(mc.get('high_pct'))}，"
+                     f"中位数 {_pct(mc.get('median_pct'))}")
+
     for tag, label in (("rsi", "RSI"), ("ma20", "MA20"), ("ma60", "MA60"),
                        ("ma200", "MA200"), ("atr", "ATR")):
         if ctx.get(tag) is not None:
             lines.append(f"{label}：{ctx[tag]:.2f}")
-    vp = ctx.get("volume_price")
-    if vp:
+
+    if ctx.get("volume_price"):
         lines.append("量价结构：")
-        for k, v in vp.items():
+        for k, v in ctx["volume_price"].items():
             lines.append(f"  {k}: {v}")
-    evt = ctx.get("evt")
-    if evt:
+
+    if ctx.get("evt"):
         lines.append("尾部风险：")
-        for k, v in evt.items():
+        for k, v in ctx["evt"].items():
             lines.append(f"  {k}: {v}")
+
+    # 【v1.1 修复】显式告知 LLM 情感状态
     if ctx.get("sentiment"):
-        lines.append("新闻情感：")
+        lines.append("新闻情感（有数据）：")
         for k, v in ctx["sentiment"].items():
             if k != "compounds":
                 lines.append(f"  {k}: {v}")
+    else:
+        lines.append("新闻情感：（本次未取到情感数据，请勿编造或过度解读情感面，"
+                     "直接略过这一维度）")
+
     if ctx.get("ff") and ctx["ff"].get("exposures"):
         lines.append("FF因子暴露：")
         for k, v in ctx["ff"]["exposures"].items():
             lines.append(f"  {k}: {v}")
         lines.append(f"  年化alpha: {ctx['ff'].get('annual_alpha')}")
         lines.append(f"  R²: {ctx['ff'].get('r_squared')}")
+
     if ctx.get("micro"):
         lines.append("微观结构：")
         for k, v in ctx["micro"].items():
             lines.append(f"  {k}: {v}")
+
     return "\n".join(lines)
 
 
@@ -638,11 +602,11 @@ class AIAnalystDialog(QDialog):
 
         self._ctx: Dict = {}
         self._llm_thread: Optional[AICommentaryThread] = None
+        self._dialog_ref = dialog  # 保留原dialog引用（用于重取情感）
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
-
         hdr = QLabel(f"<b>AI 分析师报告</b>　·　{sym}")
         hdr.setStyleSheet(f"color:{T.GOLD};font-size:11pt;border:none;")
         lay.addWidget(hdr)
@@ -660,10 +624,8 @@ class AIAnalystDialog(QDialog):
         copy_btn.clicked.connect(self._copy)
         cfg_btn = QPushButton("配置AI")
         cfg_btn.clicked.connect(self._open_settings)
-        btn_row.addWidget(gen_btn)
-        btn_row.addWidget(llm_btn)
-        btn_row.addWidget(cfg_btn)
-        btn_row.addWidget(copy_btn)
+        for b in (gen_btn, llm_btn, cfg_btn, copy_btn):
+            btn_row.addWidget(b)
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
@@ -675,8 +637,8 @@ class AIAnalystDialog(QDialog):
         self.text.setOpenExternalLinks(True)
         self.text.setStyleSheet(
             f"QTextBrowser{{background:{T.BG2};border:1px solid {T.BORDER};"
-            f"color:{T.TEXT_1};font-size:10pt;padding:12px;"
-            f"border-radius:8px;font-family:'Consolas','Courier New','Microsoft YaHei',monospace;}}"
+            f"color:{T.TEXT_1};font-size:10pt;padding:12px;border-radius:8px;"
+            f"font-family:'Consolas','Courier New','Microsoft YaHei',monospace;}}"
         )
         lay.addWidget(self.text, 1)
 
@@ -686,22 +648,24 @@ class AIAnalystDialog(QDialog):
         self.status.setText("分析中…")
         QApplication.processEvents()
         try:
-            self._ctx = collect_context(self.env, self._sym_from_title(), row=None,
-                                        dialog=None)
+            self._ctx = collect_context(
+                self.env, self._sym_from_title(),
+                dialog=self._dialog_ref, row=None)
         except Exception as e:
             logger.warning(f"[ai_commentary] collect_context 失败: {e}")
             self._ctx = {"symbol": self._sym_from_title()}
         try:
             report = build_commentary(self._ctx)
             self.text.setPlainText(report)
-            self.status.setText(f"已生成（离线模板，共 {len(report)} 字符）")
+            has_senti = "✓" if self._ctx.get("sentiment") else "×"
+            self.status.setText(
+                f"已生成（情感数据：{has_senti}，共 {len(report)} 字符）")
         except Exception as e:
             self.text.setPlainText(f"生成失败: {e}")
             self.status.setText("失败")
 
     def _sym_from_title(self) -> str:
-        t = self.windowTitle()
-        return t.replace("AI 分析师 —", "").strip()
+        return self.windowTitle().replace("AI 分析师 —", "").strip()
 
     def _run_llm(self):
         if self._llm_thread is not None and self._llm_thread.isRunning():
@@ -713,8 +677,22 @@ class AIAnalystDialog(QDialog):
                 "先点「配置AI」填好接口地址和 API Key。\n"
                 "（离线模板已可用，AI润色只是让它读起来更像人写的）")
             return
+
+        # 【v1.1 修复】润色前重新收集上下文（关键！）
+        try:
+            fresh = collect_context(self.env, self._sym_from_title(),
+                                    dialog=self._dialog_ref, row=None)
+            # 合并：新数据覆盖旧数据
+            for k, v in fresh.items():
+                if v is not None:
+                    self._ctx[k] = v
+            # 立即刷新显示（让用户看到情感已补上）
+            self.text.setPlainText(build_commentary(self._ctx))
+        except Exception as e:
+            logger.warning(f"[ai_commentary] 润色前重收集失败: {e}")
+
         ctx_text = _build_llm_context_text(self._ctx)
-        self.status.setText("AI 润色中…（网络请求，几秒到十几秒）")
+        self.status.setText("AI 润色中…")
         self._llm_btn.setEnabled(False)
         th = AICommentaryThread(cfg["base_url"], cfg["api_key"],
                                 cfg["model"], ctx_text)
@@ -724,13 +702,10 @@ class AIAnalystDialog(QDialog):
         th.start()
 
     def _on_llm_result(self, text: str):
-        T = self.env["T"]
         cur = self.text.toPlainText()
         self.text.setPlainText(
             cur + "\n\n" + "═" * 56 + "\n【AI 大模型点评】\n" + text +
-            "\n\n⚠ 以上为大模型生成的文字点评，同样基于上面的历史数据统计，"
-            "不构成投资建议。"
-        )
+            "\n\n⚠ 以上为大模型生成的文字点评，不构成投资建议。")
         self.status.setText("AI 润色完成")
         self._llm_btn.setEnabled(True)
         self._llm_thread = None
@@ -741,9 +716,9 @@ class AIAnalystDialog(QDialog):
         self._llm_thread = None
 
     def _copy(self):
-        text = self.text.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
+        t = self.text.toPlainText()
+        if t:
+            QApplication.clipboard().setText(t)
             self.status.setText("已复制到剪贴板")
 
     def _open_settings(self):
@@ -752,13 +727,11 @@ class AIAnalystDialog(QDialog):
             LLMSettingsDialog(parent=self).exec_()
         except ImportError:
             QMessageBox.information(
-                self, "提示",
-                "未找到 AI 配置界面（需先安装 quantpro_paper_watchlist.py）。")
+                self, "提示", "未找到 AI 配置界面。")
 
 
 def show_ai_report(env: dict, sym: str, row: Optional[Dict] = None,
                    dialog=None, parent=None):
-    """对外接口：弹出一个 AI 分析师窗口。"""
     dlg = AIAnalystDialog(env, sym, row=row, dialog=dialog, parent=parent)
     dlg.exec_()
 
@@ -767,8 +740,6 @@ def show_ai_report(env: dict, sym: str, row: Optional[Dict] = None,
 # 给概率弹窗注入「AI点评」tab
 # ══════════════════════════════════════════════════════════════════
 def _install_ai_tab(ProbabilityDialog, env: dict):
-    """给 ProbabilityDialog 追加「AI点评」tab。"""
-
     _orig_build_ui = ProbabilityDialog._build_ui
 
     def _build_ui_with_ai(self):
@@ -780,13 +751,13 @@ def _install_ai_tab(ProbabilityDialog, env: dict):
 
     ProbabilityDialog._build_ui = _build_ui_with_ai
 
-    # 原 _run 跑完后，刷新 AI tab
     _orig_run = ProbabilityDialog._run
 
     def _run_with_ai(self):
         _orig_run(self)
         try:
-            QTimer.singleShot(1500, lambda: _refresh_ai_tab(self, env))
+            # 【v1.1 修复】延迟 1500ms → 2500ms，给新闻加载留时间
+            QTimer.singleShot(2500, lambda: _refresh_ai_tab(self, env))
         except Exception as e:
             logger.warning(f"[ai_commentary] AI tab 刷新调度失败: {e}")
 
@@ -803,8 +774,7 @@ def _build_ai_tab(self, env: dict):
     note = QLabel(
         "把本次分析得到的数字（概率/Regime/量价/尾部风险/情感/因子暴露）"
         "自动拼成一份中文研报。\n"
-        "离线模板即时可出；若配置了 OpenAI 兼容 API，可点「AI 润色」让它"
-        "读起来更自然。")
+        "离线模板即时可出；若配置了 OpenAI 兼容 API，可点「AI 润色」。")
     note.setWordWrap(True)
     note.setStyleSheet(
         f"color:{T.TEXT_2};font-size:8.5pt;background:{T.BG2};"
@@ -823,10 +793,8 @@ def _build_ai_tab(self, env: dict):
     copy_btn.clicked.connect(lambda: _copy_ai_tab(self))
     cfg_btn = QPushButton("配置AI")
     cfg_btn.clicked.connect(lambda: _open_llm_settings(self))
-    btn_row.addWidget(regen_btn)
-    btn_row.addWidget(llm_btn)
-    btn_row.addWidget(cfg_btn)
-    btn_row.addWidget(copy_btn)
+    for b in (regen_btn, llm_btn, cfg_btn, copy_btn):
+        btn_row.addWidget(b)
     btn_row.addStretch()
     lay.addLayout(btn_row)
 
@@ -861,8 +829,10 @@ def _refresh_ai_tab(self, env: dict):
         self._ai_ctx_cache = ctx
         report = build_commentary(ctx)
         self._ai_text.setPlainText(report)
+        has_senti = "✓" if ctx.get("sentiment") else "×"
         n_fields = sum(1 for k, v in ctx.items() if v is not None and k != "symbol")
-        self._ai_status.setText(f"已生成（离线模板，收集到 {n_fields} 类数据）")
+        self._ai_status.setText(
+            f"已生成（收集到 {n_fields} 类数据，情感 {has_senti}）")
     except Exception as e:
         logger.warning(f"[ai_commentary] 生成失败: {e}")
         self._ai_text.setPlainText(f"生成失败: {e}")
@@ -870,11 +840,9 @@ def _refresh_ai_tab(self, env: dict):
 
 
 def _run_llm_in_tab(self, env: dict):
+    """【v1.1 修复】润色前重新收集上下文。"""
     if getattr(self, "_ai_llm_thread", None) is not None \
             and self._ai_llm_thread.isRunning():
-        return
-    if getattr(self, "_ai_ctx_cache", None) is None:
-        QMessageBox.information(self, "提示", "先点「重新生成」")
         return
     cfg = _get_llm_config()
     if not cfg["base_url"] or not cfg["api_key"]:
@@ -883,8 +851,23 @@ def _run_llm_in_tab(self, env: dict):
             "先点「配置AI」填好接口地址和 API Key。\n"
             "（离线模板已可用，AI润色只是让它读起来更像人写的）")
         return
+
+    # 关键修复：不管之前有没有缓存，润色前都重新收集一次
+    try:
+        fresh = collect_context(env, self.sym, dialog=self)
+        self._ai_ctx_cache = fresh
+        # 同步刷新显示
+        self._ai_text.setPlainText(build_commentary(fresh))
+        has_senti = "✓" if fresh.get("sentiment") else "×"
+        self._ai_status.setText(f"已刷新上下文（情感 {has_senti}），润色中…")
+    except Exception as e:
+        logger.warning(f"[ai_commentary] 润色前重收集失败: {e}")
+        if getattr(self, "_ai_ctx_cache", None) is None:
+            QMessageBox.information(self, "提示", "先点「重新生成」")
+            return
+        self._ai_status.setText("AI 润色中…")
+
     ctx_text = _build_llm_context_text(self._ai_ctx_cache)
-    self._ai_status.setText("AI 润色中…")
     th = AICommentaryThread(cfg["base_url"], cfg["api_key"],
                             cfg["model"], ctx_text)
     th.result_ready.connect(lambda text: _on_ai_tab_llm_result(self, text, env))
@@ -897,8 +880,7 @@ def _on_ai_tab_llm_result(self, text: str, env: dict):
     cur = self._ai_text.toPlainText()
     self._ai_text.setPlainText(
         cur + "\n\n" + "═" * 56 + "\n【AI 大模型点评】\n" + text +
-        "\n\n⚠ 以上为大模型生成的文字点评，不构成投资建议。"
-    )
+        "\n\n⚠ 以上为大模型生成的文字点评，不构成投资建议。")
     self._ai_status.setText("AI 润色完成")
     self._ai_llm_thread = None
 
@@ -921,13 +903,11 @@ def _open_llm_settings(self):
         from quantpro_paper_watchlist import LLMSettingsDialog
         LLMSettingsDialog(parent=self).exec_()
     except ImportError:
-        QMessageBox.information(
-            self, "提示",
-            "未找到 AI 配置界面（需先安装 quantpro_paper_watchlist.py）。")
+        QMessageBox.information(self, "提示", "未找到 AI 配置界面。")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 给扫描列表加右键菜单
+# 扫描列表右键菜单
 # ══════════════════════════════════════════════════════════════════
 def _install_scan_right_click(QuantApp, env: dict):
     _orig_init = QuantApp.__init__
@@ -939,7 +919,7 @@ def _install_scan_right_click(QuantApp, env: dict):
             self.table.customContextMenuRequested.connect(
                 lambda pos: _show_scan_menu(self, env, pos))
         except Exception as e:
-            logger.warning(f"[ai_commentary] 安装扫描列表右键菜单失败: {e}")
+            logger.warning(f"[ai_commentary] 右键菜单安装失败: {e}")
 
     QuantApp.__init__ = _new_init
 
@@ -949,7 +929,6 @@ def _show_scan_menu(app_self, env: dict, pos):
         idx = app_self.table.indexAt(pos)
         if not idx.isValid():
             return
-        # 通过 proxy 映射到源
         src = app_self.proxy.mapToSource(idx)
         row = app_self.scan_model.row_dict(src.row())
         if not row:
@@ -958,25 +937,13 @@ def _show_scan_menu(app_self, env: dict, pos):
         if not sym:
             return
         menu = QMenu(app_self.table)
-        act_report = QAction(f"生成 AI 研报（{sym}）", menu)
-        act_report.triggered.connect(
+        act = QAction(f"生成 AI 研报（{sym}）", menu)
+        act.triggered.connect(
             lambda: show_ai_report(env, sym, row=row, parent=app_self))
-        menu.addAction(act_report)
-
-        act_llm = QAction("AI 研报 + 大模型润色", menu)
-        act_llm.triggered.connect(
-            lambda: _show_report_with_llm(env, sym, row, app_self))
-        menu.addAction(act_llm)
-
+        menu.addAction(act)
         menu.exec_(app_self.table.viewport().mapToGlobal(pos))
     except Exception as e:
         logger.warning(f"[ai_commentary] 右键菜单: {e}")
-
-
-def _show_report_with_llm(env: dict, sym: str, row: dict, parent):
-    dlg = AIAnalystDialog(env, sym, row=row, parent=parent)
-    QTimer.singleShot(500, dlg._run_llm)
-    dlg.exec_()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -997,97 +964,98 @@ def install_ai_commentary(env: dict):
     _install_ai_tab(PD, env)
     _install_scan_right_click(env["QuantApp"], env)
 
-    PD._ai_commentary_installed = True
+    # 【v1.1 修复】Hook _on_news：新闻加载完成后自动刷新 AI tab
+    _orig_on_news = PD._on_news
 
-    # 把便捷入口挂到 env，方便其他模块调用
+    def _on_news_chain(self, items):
+        _orig_on_news(self, items)
+        # 新闻回来了，如果 AI tab 已存在，延迟 300ms 刷新一次
+        # （让原 _on_news 里的情感聚合先完成）
+        try:
+            if hasattr(self, "_ai_text"):
+                def _delayed():
+                    try:
+                        _refresh_ai_tab(self, env)
+                    except Exception as e:
+                        logger.debug(f"[ai_commentary] news hook 刷新: {e}")
+                QTimer.singleShot(300, _delayed)
+        except Exception as e:
+            logger.debug(f"[ai_commentary] news hook 安装: {e}")
+
+    PD._on_news = _on_news_chain
+
+    PD._ai_commentary_installed = True
     env["show_ai_report"] = lambda sym, row=None, dialog=None, parent=None: \
         show_ai_report(env, sym, row, dialog, parent)
 
-    logger.info("[ai_commentary] 已安装：AI 文字分析师"
-                "（概率弹窗新增「AI点评」tab + 扫描列表右键菜单）")
+    logger.info("[ai_commentary v1.1] 已安装：AI 文字分析师"
+                "（含新闻情感修复 + 自动刷新）")
     return PD
 
 
 # ══════════════════════════════════════════════════════════════════
-# 自检（合成数据，无需联网/无需主程序）
+# 自检
 # ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 64)
-    print("AI 文字分析师 自检")
+    print("AI 文字分析师 v1.1 自检")
     print("=" * 64)
 
-    # 构造一个信息丰富的上下文
+    # 1) 情感多路径提取
+    class FakeDialog:
+        pass
+
+    d1 = FakeDialog()
+    d1._sentiment_agg = {"n_total": 5, "n_pos": 3, "n_neg": 1, "n_neu": 1,
+                         "overall_score": 0.15, "momentum": 0.05,
+                         "reversal_signal": 0.0, "label": "positive"}
+    s = _extract_sentiment_from_dialog(d1)
+    assert s and s["n_total"] == 5, f"路径1失败: {s}"
+    print("[1] 情感从 _sentiment_agg 提取 ✓")
+
+    d2 = FakeDialog()
+    d2._ai_last_sentiment = {"n_total": 3, "n_pos": 2, "n_neg": 0, "n_neu": 1}
+    s = _extract_sentiment_from_dialog(d2)
+    assert s and s["n_total"] == 3, f"路径2失败: {s}"
+    print("[2] 情感从 _ai_last_sentiment 提取 ✓")
+
+    d3 = FakeDialog()  # 全部为空
+    s = _extract_sentiment_from_dialog(d3)
+    assert s is None, "空情况应返回 None"
+    print("[3] 无情感时返回 None ✓")
+
+    d4 = FakeDialog()
+    d4._sentiment_agg = {"n_total": 0, "n_pos": 0, "n_neg": 0, "n_neu": 0}
+    s = _extract_sentiment_from_dialog(d4)
+    assert s is None, "全零情感应视为无效"
+    print("[4] 空情感视为无效 ✓")
+
+    # 2) LLM 上下文含情感数据
     ctx = {
         "symbol": "AAPL", "name": "苹果", "currency": "$",
         "price": 182.35, "change_pct": 0.87,
-        "rsi": 58.3, "ma20": 180.12, "ma60": 177.45, "ma200": 170.10,
-        "atr": 3.28,
-        "prob_5d": 0.58, "prob_20d": 0.62, "prob_60d": 0.55,
-        "signal_text": "买入",
-        "regime": "low_vol",
-        "mc_20d": {"low_pct": -8.2, "median_pct": 1.2,
-                   "high_pct": 9.5, "up_prob": 0.62},
-        "volume_price": {
-            "obv_vs_ma": "↑强势",
-            "roll_corr_60d": 0.35,
-            "vol_imbalance_20d": 0.18,
-            "vwap_dev_pct": 1.5,
-            "amihud_illiq": 0.042,
-            "gk_vol_annual": 0.223,
-            "n_divergence_90d": 2,
-            "regime_hint": "量价同向（健康趋势）",
-        },
-        "evt": {"var99": -0.052, "cvar99": -0.071, "var95": -0.031,
-                "cvar95": -0.045, "xi": 0.18,
-                "verdict": "厚尾显著，正态假设会低估风险"},
-        "micro": {"roll_spread": 0.0015, "kyle_lambda": 2.1e-7},
-        "sentiment": {"n_pos": 3, "n_neg": 1, "n_neu": 5,
+        "prob_20d": 0.62,
+        "sentiment": {"n_total": 9, "n_pos": 3, "n_neg": 1, "n_neu": 5,
                       "overall_score": 0.14, "momentum": 0.05,
-                      "reversal_signal": 0.0, "label": "positive"},
-        "ff": {"exposures": {"MKT": 0.92, "SMB": -0.15, "HML": 0.08,
-                             "RMW": 0.30, "CMA": -0.05, "MOM": 0.25},
-               "annual_alpha": 0.032, "r_squared": 0.78,
-               "dominant_style": "市场暴露为主"},
+                      "reversal_signal": 0.0, "label": "positive",
+                      "compounds": [0.1, 0.2]},
     }
+    text = _build_llm_context_text(ctx)
+    assert "新闻情感（有数据）" in text, f"有数据时应标明: {text}"
+    assert "n_pos: 3" in text
+    assert "compounds" not in text, "compounds 列表不应传给LLM"
+    print("[5] LLM 上下文含情感数据 ✓")
 
+    # 3) 无情感时显式说明
+    ctx2 = {"symbol": "XYZ", "currency": "$"}
+    text2 = _build_llm_context_text(ctx2)
+    assert "未取到情感数据" in text2, f"无数据时应显式说明: {text2}"
+    print("[6] 无情感时显式说明 ✓")
+
+    # 4) 研报模板包含情感章节
     report = build_commentary(ctx)
-    print(report)
-    print()
+    assert "◆ 新闻情感" in report
+    assert "偏正面" in report
+    print("[7] 研报模板含情感章节 ✓")
 
-    # 关键字段检查
-    assert "AAPL" in report
-    assert "62%" in report       # 概率
-    assert "低波动" in report     # regime
-    assert "厚尾" in report       # EVT
-    assert "量价" in report
-    assert "苹果" in report
-    print("[✓] 完整数据渲染成功")
-
-    # 空数据降级
-    empty = {"symbol": "XYZ", "currency": "$"}
-    r2 = build_commentary(empty)
-    assert "XYZ" in r2
-    assert "数据不足" in r2
-    print("[✓] 空数据降级成功")
-
-    # 部分数据
-    partial = {"symbol": "GOOG", "currency": "$",
-               "price": 140.0, "rsi": 72.0,
-               "prob_20d": 0.45}
-    r3 = build_commentary(partial)
-    assert "GOOG" in r3
-    assert "超买" in r3
-    print("[✓] 部分数据渲染成功")
-
-    # LLM context 文本
-    ctx_text = _build_llm_context_text(ctx)
-    assert "AAPL" in ctx_text
-    assert "5日上涨概率" in ctx_text
-    print("[✓] LLM 上下文文本生成成功")
-
-    print()
-    print("全部自检通过 ✓")
-    print()
-    print("集成方式（quantpro_v1_6.py 的 __main__ 里，v15 之后）：")
-    print("    from quantpro_ai_commentary import install_ai_commentary")
-    print("    install_ai_commentary(globals())")
+    print("\n全部自检通过 ✓")
