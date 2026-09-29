@@ -4778,21 +4778,25 @@ if __name__ == "__main__":
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     except Exception:
         pass
-    for attr in ('AA_EnableHighDpiScaling','AA_UseHighDpiPixmaps'):
+    for attr in ('AA_EnableHighDpiScaling', 'AA_UseHighDpiPixmaps'):
         if hasattr(Qt, attr):
             QApplication.setAttribute(getattr(Qt, attr))
-    
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setWindowIcon(_make_app_icon())
-    
+
     db = QFontDatabase()
-    for f in ["Microsoft YaHei","SimHei","PingFang SC","Noto Sans CJK SC"]:
+    for f in ["Microsoft YaHei", "SimHei", "PingFang SC", "Noto Sans CJK SC"]:
         if f in db.families():
             app.setFont(QFont(f, 10))
             break
 
-    # ── ① v14 方法论注入（必须在创建任何引擎/窗口之前）─────────────
+    # ══════════════════════════════════════════════════════════════
+    # 模块安装（顺序有讲究，改动前请先看每个注释）
+    # ══════════════════════════════════════════════════════════════
+
+    # ── ① v14 方法论注入（必须在创建任何引擎/窗口之前）───────────
     try:
         from quantpro_v14_alpha_engine import patch_quantpro
         patch_quantpro(ProbabilityEngine, WalkForwardBacktest, SelfCorrectionEngine,
@@ -4800,21 +4804,21 @@ if __name__ == "__main__":
     except ImportError as _e:
         logger.warning(f"v14 alpha engine 未加载（缺文件 quantpro_v14_alpha_engine.py）: {_e}")
 
-    # ── ② 安装 ticker_logos 工具集（必须先于 scan_logos 和 market_dashboard） ──
+    # ── ② 安装 ticker_logos 工具集（必须先于 scan_logos 和 market_dashboard）──
     try:
         from quantpro_ticker_logos import install_ticker_logos
         install_ticker_logos(globals())
     except ImportError as _e:
         logger.warning(f"ticker_logos 未加载（缺文件 quantpro_ticker_logos.py）: {_e}")
 
-    # ── ③ 安装扫描列表 logo 功能（必须在 QuantApp 创建之前） ──────
+    # ── ③ 安装扫描列表 logo 功能（必须在 QuantApp 创建之前）───────
     try:
         from quantpro_scan_logos import install_scan_logos
         install_scan_logos(globals())
     except ImportError as _e:
         logger.warning(f"scan_logos 未加载（缺文件 quantpro_scan_logos.py）: {_e}")
 
-    # ── ④ 安装大盘仪表盘（依赖 ticker_logos） ──────────────────────
+    # ── ④ 安装大盘仪表盘（依赖 ticker_logos）──────────────────────
     try:
         from quantpro_market_dashboard import install_market_dashboard
         install_market_dashboard(globals())
@@ -4842,7 +4846,39 @@ if __name__ == "__main__":
     except ImportError as _e:
         logger.warning(f"量价分析未加载（缺文件 quantpro_volume_analysis.py）: {_e}")
 
-    # ── ⑧ 创建主窗口 ────────────────────────────────────────────
+    # ── ⑧ GARCH 拟合稳健化（修复 arch -1 优化失败）────────────────
+    try:
+        from quantpro_garch_fix import install_garch_fix
+        install_garch_fix(globals())
+    except ImportError as _e:
+        logger.warning(f"GARCH修复未加载（缺文件 quantpro_garch_fix.py）: {_e}")
+
+    # ── ⑨ 新闻模块健壮化（多源容错 + 详细诊断）───────────────────
+    try:
+        from quantpro_news_fix import install_news_fix
+        install_news_fix(globals())
+    except ImportError as _e:
+        logger.warning(f"新闻修复未加载（缺文件 quantpro_news_fix.py）: {_e}")
+
+    # ── ⑩ v15 前沿方法引擎（BOCPD/EVT/Kalman/OU/Copula/FF/
+    #       Stacking/Permutation/BL/CPCV/Microstructure/Drift）────
+    #     必须在 GARCH 修复之后：v15 会覆盖 ProbabilityEngine.detect_regime，
+    #     而 GARCH 修复只动 monte_carlo，两者互不冲突但建议后装。
+    try:
+        from quantpro_v15_advanced_engine import install_advanced_engine
+        install_advanced_engine(globals())
+    except ImportError as _e:
+        logger.warning(f"v15 高级引擎未加载（缺文件 quantpro_v15_advanced_engine.py）: {_e}")
+
+    # ── ⑩.5 AI 文字分析师（离线模板 + 可选 LLM 润色）─────────────
+    #      放在 v15 之后：这样可以拿到 v15 增强后的 detect_regime
+    try:
+        from quantpro_ai_commentary import install_ai_commentary
+        install_ai_commentary(globals())
+    except ImportError as _e:
+        logger.warning(f"AI分析师未加载（缺文件 quantpro_ai_commentary.py）: {_e}")
+
+    # ── ⑪ 创建主窗口 ────────────────────────────────────────────
     win = QuantApp()
     win.show()
     sys.exit(app.exec_())
