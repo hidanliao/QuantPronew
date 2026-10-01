@@ -441,6 +441,7 @@ def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
 def clear_cache():
     with _cache_lock: _data_cache.clear()
 
+_SCAN_QUOTES: Dict[str, tuple] = {}   # {代码: (现价, 昨收)}，扫描前由 quantpro_top100_speedup 批量填充
 SCAN_LIVE_QUOTE = False   # 扫描列表是否逐只拉实时报价（True 会很慢：每只多 2~3 次请求）
 
 _rt_cache: Dict[str, tuple] = {}
@@ -2906,8 +2907,11 @@ class AnalysisThread(QThread):
             # 【提速】批量扫描默认直接用 10y 日线最后一根K线（Yahoo 日线末根盘中即为最新价），
             # 不再为每只股票额外创建 Ticker 调 fast_info/info（每只≈2~3次额外请求，100只=200+次）。
             # 需要逐只精确实时价时，把 SCAN_LIVE_QUOTE 改成 True。
-            rp=get_realtime_price(sym) if SCAN_LIVE_QUOTE else None
-            if rp is not None:
+            _q=_SCAN_QUOTES.get(_normalize(sym))      # 批量实时报价（现价, 昨收）
+            rp=None if _q else (get_realtime_price(sym) if SCAN_LIVE_QUOTE else None)
+            if _q:
+                close=float(_q[0]); chg=(close-float(_q[1]))/float(_q[1])*100
+            elif rp is not None:
                 close=rp; prev=None
                 try:
                     fi=getattr(yf.Ticker(sym),'fast_info',None)
