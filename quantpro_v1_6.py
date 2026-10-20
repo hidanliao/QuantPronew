@@ -408,7 +408,66 @@ def _currency(sym: str) -> str:
 def _normalize(sym: str) -> str: return sym.replace("/", "-")
 
 _cache_lock = threading.Lock()
-_data_cache: Dict[str, pd.DataFrame] = {}
+
+# 各周期缓存过期时间（秒）：长开不关时避免内存无限增长；访问时惰性淘汰
+_PERIOD_TTL = {
+    "1mo": 300, "5d": 300, "3mo": 1800, "6mo": 3600,
+    "1y": 6 * 3600, "5y": 12 * 3600, "10y": 24 * 3600,
+}
+
+class _TTLCache(dict):
+    """带 TTL 的行情缓存：按 key 的 period 后缀（AAPL_10y → 10y）设置过期时间。
+    兼容 dict 的 __getitem__/__contains__/get/pop/clear，过期条目在访问时淘汰。"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ts: Dict[str, float] = {}
+
+    @staticmethod
+    def _ttl(key: str) -> float:
+        try:
+            period = key.rsplit("_", 1)[-1]
+        except Exception:
+            period = ""
+        return _PERIOD_TTL.get(period, 6 * 3600)
+
+    def _fresh(self, key: str) -> bool:
+        ts = self._ts.get(key)
+        return ts is not None and time.time() - ts < self._ttl(key)
+
+    def _evict(self, key: str):
+        self._ts.pop(key, None)
+        super().pop(key, None)
+
+    def __setitem__(self, key, val):
+        self._ts[key] = time.time()
+        super().__setitem__(key, val)
+
+    def __getitem__(self, key):
+        if key in self._ts and not self._fresh(key):
+            self._evict(key)
+            raise KeyError(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        if key in self._ts and not self._fresh(key):
+            self._evict(key)
+        return super().__contains__(key)
+
+    def get(self, key, default=None):
+        if key in self._ts and not self._fresh(key):
+            self._evict(key)
+            return default
+        return super().get(key, default)
+
+    def pop(self, key, *args):
+        self._ts.pop(key, None)
+        return super().pop(key, *args)
+
+    def clear(self):
+        self._ts.clear()
+        super().clear()
+
+_data_cache: Dict[str, pd.DataFrame] = _TTLCache()
 
 def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
     sym = _normalize(sym); key = f"{sym}_{period}"
@@ -418,7 +477,7 @@ def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
     # yf.download() 内部使用全局共享状态，多线程并发调用时会把不同股票的
     # 数据互相覆盖/错配（症状：多只股票指标完全相同、涨跌%出现天文数字）。
     # Ticker.history() 每个股票独立对象、不共享全局状态，多线程安全。
-    for _ in range(3):
+    for attempt in range(3):
         try:
             tk = yf.Ticker(sym)
             df = tk.history(period=period, auto_adjust=True)
@@ -435,7 +494,8 @@ def fetch_stock_data(sym: str, period: str = "6mo") -> pd.DataFrame:
                 with _cache_lock: _data_cache[key] = df
                 return df
         except Exception as e:
-            logger.warning(f"Download {sym}: {e}"); time.sleep(1)
+            logger.warning(f"Download {sym}: {e}")
+            time.sleep(0.5 * (2 ** attempt))   # 指数退避：0.5 / 1 / 2s，避免 429 时线程同时重试
     return pd.DataFrame()
 
 def clear_cache():
@@ -446,7 +506,39 @@ SCAN_LIVE_QUOTE = False   # 扫描列表是否逐只拉实时报价（True 会�
 
 _rt_cache: Dict[str, tuple] = {}
 _rt_lock = threading.Lock()
-_RT_TTL = 5.0
+_RT_TTL = 15.0
+
+_QUOTE_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+_QUOTE_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+
+def _fetch_chart_quote(sym: str, sess=None):
+    """Yahoo chart 接口（range=1d）meta：regularMarketPrice=现价，chartPreviousClose=昨收。
+    一次轻量请求即可同时拿到两者（无需 crumb），比 fast_info/.info 都快；失败返回 None。
+    sess=None 时内部创建会话（线程安全），传入了会话则复用。"""
+    from urllib.parse import quote
+    own = sess is None
+    if own:
+        sess = requests.Session()
+    try:
+        for host in _QUOTE_HOSTS:
+            try:
+                r = sess.get(f"https://{host}/v8/finance/chart/{quote(sym, safe='')}",
+                             params={"range": "1d", "interval": "1d"},
+                             headers=_QUOTE_UA, timeout=(3, 6))
+                if r.status_code != 200:
+                    continue
+                meta = r.json()["chart"]["result"][0]["meta"]
+                px = meta.get("regularMarketPrice")
+                prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+                if px and prev and px > 0 and prev > 0:
+                    return float(px), float(prev)
+            except Exception:
+                continue
+        return None
+    finally:
+        if own:
+            sess.close()
 
 def get_realtime_price(sym: str) -> Optional[float]:
     with _rt_lock:
@@ -454,18 +546,22 @@ def get_realtime_price(sym: str) -> Optional[float]:
             ts, p = _rt_cache[sym]
             if time.time() - ts < _RT_TTL: return p
     try:
+        q = _fetch_chart_quote(sym)
+        if q:
+            with _rt_lock: _rt_cache[sym] = (time.time(), float(q[0]))
+            return float(q[0])
+    except Exception:
+        pass
+    # 回退：fast_info（远快于 .info），不再调用 quoteSummary
+    try:
         tk = yf.Ticker(sym)
         if hasattr(tk, 'fast_info') and tk.fast_info:
             p = tk.fast_info.last_price
             if p is not None:
                 with _rt_lock: _rt_cache[sym] = (time.time(), float(p))
                 return float(p)
-        info = tk.info
-        p = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('lastPrice')
-        if p is not None:
-            with _rt_lock: _rt_cache[sym] = (time.time(), float(p))
-            return float(p)
-    except: pass
+    except Exception:
+        pass
     return None
 
 # ══════════════════════════════════════════════════════════════════
@@ -2666,20 +2762,28 @@ class IndexTickerThread(QThread):
         self._stop=False
     def stop(self): self._stop=True
     def run(self):
-        while not self._stop:
-            try:
-                data={}
-                for sym,name in self.symbols.items():
-                    tk=yf.Ticker(sym); hist=tk.history(period="1d")
-                    if not hist.empty:
-                        price=hist.iloc[-1]['Close']; prev=tk.info.get('previousClose',price)
-                        chg=price-prev; pct=chg/prev*100 if prev else 0.
-                        data[sym]=(price,chg,pct,name)
-                self.data_ready.emit(data)
-            except Exception as e: self.error_msg.emit(str(e))
-            for _ in range(30):
-                if self._stop: break
-                self.sleep(1)
+        sess = requests.Session()
+        try:
+            while not self._stop:
+                try:
+                    data={}
+                    for sym,name in self.symbols.items():
+                        q=_fetch_chart_quote(sym, sess)   # 1 次轻量请求拿现价+昨收，不再打慢的 tk.info
+                        if q:
+                            price,prev=q; chg=price-prev; pct=chg/prev*100 if prev else 0.
+                            data[sym]=(price,chg,pct,name)
+                        else:
+                            hist=yf.Ticker(sym).history(period="1d")
+                            if not hist.empty:
+                                price=hist.iloc[-1]['Close']
+                                data[sym]=(price,0.0,0.0,name)
+                    self.data_ready.emit(data)
+                except Exception as e: self.error_msg.emit(str(e))
+                for _ in range(30):
+                    if self._stop: break
+                    self.sleep(1)
+        finally:
+            sess.close()
 
 # ══════════════════════════════════════════════════════════════════
 # Top 100 加载器
